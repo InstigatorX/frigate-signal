@@ -1,0 +1,13 @@
+services:
+  frigate-signal:
+    build: .
+    container_name: frigate-signal
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "5001:5001"
+    volumes:
+      - ./events.db:/app/events.db
+      - ./camera_topology.json:/app/camera_topology.json:ro
+      - ./incident_prompt.txt:/app/incident_prompt.txt:ro
