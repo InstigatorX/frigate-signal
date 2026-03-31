@@ -82,6 +82,12 @@ VIDEO_OUTPUT_DIR = os.getenv("VIDEO_OUTPUT_DIR", "incident_videos")
 VIDEO_FFMPEG_BIN = os.getenv("VIDEO_FFMPEG_BIN", "ffmpeg")
 VIDEO_SOURCE_BASE = os.getenv("VIDEO_SOURCE_BASE", FRIGATE_VOD_BASE)
 VIDEO_MIN_EVENTS = int(os.getenv("VIDEO_MIN_EVENTS", "2"))
+VIDEO_CLIP_PADDING_SECONDS = max(
+    0, int(os.getenv("VIDEO_CLIP_PADDING_SECONDS", "1"))
+)
+VIDEO_OUTPUT_WIDTH = int(os.getenv("VIDEO_OUTPUT_WIDTH", "1280"))
+VIDEO_OUTPUT_HEIGHT = int(os.getenv("VIDEO_OUTPUT_HEIGHT", "720"))
+VIDEO_OUTPUT_FPS = int(os.getenv("VIDEO_OUTPUT_FPS", "15"))
 
 Path(VIDEO_OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 app = Flask(__name__)
@@ -448,6 +454,9 @@ def build_event_clip_url(
     if end_ts <= start_ts:
         end_ts = start_ts + 8
 
+    start_ts = max(0, start_ts - VIDEO_CLIP_PADDING_SECONDS)
+    end_ts = end_ts + VIDEO_CLIP_PADDING_SECONDS
+
     return (
         f"{VIDEO_SOURCE_BASE.rstrip('/')}/"
         f"{camera}/start/{start_ts}/end/{end_ts}/clip.mp4"
@@ -472,6 +481,58 @@ def download_clip(url: str, path: Path) -> bool:
         return False
 
 
+def normalize_clip_for_concat(input_path: Path, output_path: Path) -> tuple[bool, str | None]:
+    cmd = [
+        VIDEO_FFMPEG_BIN,
+        "-y",
+        "-fflags",
+        "+genpts+discardcorrupt",
+        "-analyzeduration",
+        "100M",
+        "-probesize",
+        "100M",
+        "-i",
+        str(input_path),
+        "-an",
+        "-vf",
+        (
+            f"fps={VIDEO_OUTPUT_FPS},"
+            f"scale={VIDEO_OUTPUT_WIDTH}:{VIDEO_OUTPUT_HEIGHT}:"
+            "force_original_aspect_ratio=decrease,"
+            f"pad={VIDEO_OUTPUT_WIDTH}:{VIDEO_OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black,"
+            "setsar=1,format=yuv420p"
+        ),
+        "-r",
+        str(VIDEO_OUTPUT_FPS),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ]
+
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        if not output_path.exists() or output_path.stat().st_size == 0:
+            return False, "normalized_clip_empty"
+        return True, None
+    except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or "").strip()
+        print(f"[VIDEO] normalize failed {input_path}:", stderr)
+        return False, stderr[:500] if stderr else "normalize_failed"
+
+
+def write_concat_manifest(paths: list[Path], manifest_path: Path) -> None:
+    with manifest_path.open("w", encoding="utf-8") as f:
+        for path in paths:
+            escaped = str(path.resolve()).replace("'", "'\\''")
+            f.write(f"file '{escaped}'\n")
+
+
 def generate_incident_video(
     incident_id: str, events: list[dict]
 ) -> tuple[bool, str | None]:
@@ -483,7 +544,7 @@ def generate_incident_video(
     output_file = Path(VIDEO_OUTPUT_DIR) / f"{incident_id}.mp4"
 
     try:
-        local_files = []
+        normalized_files = []
 
         for idx, event in enumerate(events):
             clip_url = build_event_clip_url(
@@ -494,36 +555,49 @@ def generate_incident_video(
             if not clip_url:
                 continue
 
-            local_path = temp_dir / f"clip_{idx}.mp4"
-            if download_clip(clip_url, local_path):
-                local_files.append(local_path)
+            downloaded_path = temp_dir / f"clip_{idx}_raw.mp4"
+            normalized_path = temp_dir / f"clip_{idx}_normalized.mp4"
 
-        if len(local_files) < VIDEO_MIN_EVENTS:
+            if not download_clip(clip_url, downloaded_path):
+                continue
+
+            normalized, error = normalize_clip_for_concat(
+                downloaded_path, normalized_path
+            )
+            if normalized:
+                normalized_files.append(normalized_path)
+            else:
+                print(
+                    f"[VIDEO] skipping unusable clip for incident {incident_id}: {error}"
+                )
+
+        if len(normalized_files) < VIDEO_MIN_EVENTS:
             return False, "download_failed"
 
-        with concat_file.open("w", encoding="utf-8") as f:
-            for path in local_files:
-                f.write(f"file '{path.resolve()}'\n")
+        write_concat_manifest(normalized_files, concat_file)
 
         cmd = [
             VIDEO_FFMPEG_BIN,
             "-y",
+            "-fflags",
+            "+genpts",
             "-f",
             "concat",
             "-safe",
             "0",
             "-i",
             str(concat_file),
-            "-vf",
-            "scale=1280:-2",
+            "-an",
             "-c:v",
             "libx264",
             "-preset",
             "veryfast",
             "-crf",
             "23",
-            "-c:a",
-            "aac",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
             str(output_file),
         ]
 

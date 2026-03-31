@@ -46,6 +46,7 @@
     html,
     body {
       margin: 0;
+      height: 100%;
       background: radial-gradient(circle at top center, #0d1b38 0%, #08101d 35%, #0b1220 100%);
       color: var(--text);
       font-family: Inter, Arial, sans-serif;
@@ -53,6 +54,7 @@
 
     body {
       min-height: 100vh;
+      overflow: hidden;
     }
 
     a {
@@ -63,21 +65,26 @@
     .app {
       display: grid;
       grid-template-columns: 360px 1fr;
-      min-height: 100vh;
+      height: 100vh;
+      overflow: hidden;
     }
 
     .sidebar {
+      display: flex;
+      flex-direction: column;
       border-right: 1px solid var(--line);
       background: rgba(15, 23, 42, 0.95);
       padding: 18px 16px;
-      overflow-y: auto;
+      overflow: hidden;
       min-width: 0;
+      min-height: 0;
     }
 
     .main {
       padding: 22px;
       overflow-y: auto;
       min-width: 0;
+      min-height: 0;
     }
 
     .brand h1 {
@@ -106,6 +113,10 @@
       display: flex;
       flex-direction: column;
       gap: 10px;
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow-y: auto;
+      padding-right: 4px;
     }
 
     .incident-item {
@@ -699,14 +710,21 @@
     }
 
     @media (max-width: 920px) {
+      body {
+        overflow: auto;
+      }
+
       .app {
         grid-template-columns: 1fr;
+        height: auto;
+        overflow: visible;
       }
 
       .sidebar {
         max-height: 42vh;
         border-right: none;
         border-bottom: 1px solid var(--line);
+        overflow: hidden;
       }
 
       .hero-top {
