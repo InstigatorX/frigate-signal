@@ -8,7 +8,7 @@ import base64
 from pathlib import Path
 from collections import deque
 from datetime import datetime
-from flask import Flask, render_template, jsonify, send_file
+from flask import Flask, render_template, jsonify, send_file, request
 import paho.mqtt.client as mqtt
 import requests
 import subprocess
@@ -26,7 +26,7 @@ MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "password")
 MQTT_CLIENT_ID = os.getenv("MQTT_CLIENT_ID", "frigate-signal")
 MQTT_TLS = os.getenv("MQTT_TLS", "false").lower() in ("1", "true", "yes", "on")
 
-FRIGATE_PUBLIC_BASE = os.getenv("FRIGATE_PUBLIC_BASE", "https://ha.loebees.com/nvr")
+FRIGATE_PUBLIC_BASE = os.getenv("FRIGATE_PUBLIC_BASE", "https://ha.xxx.com/nvr")
 FRIGATE_MEDIA_PREFIX = os.getenv("FRIGATE_MEDIA_PREFIX", "/media/frigate")
 FRIGATE_CLIP_PREFIX = os.getenv("FRIGATE_CLIP_PREFIX", "")
 FRIGATE_VOD_BASE = os.getenv("FRIGATE_VOD_BASE", FRIGATE_PUBLIC_BASE + "/api")
@@ -88,6 +88,11 @@ VIDEO_CLIP_PADDING_SECONDS = max(
 VIDEO_OUTPUT_WIDTH = int(os.getenv("VIDEO_OUTPUT_WIDTH", "1280"))
 VIDEO_OUTPUT_HEIGHT = int(os.getenv("VIDEO_OUTPUT_HEIGHT", "720"))
 VIDEO_OUTPUT_FPS = int(os.getenv("VIDEO_OUTPUT_FPS", "15"))
+VIDEO_OUTPUT_PROFILE = os.getenv("VIDEO_OUTPUT_PROFILE", "main")
+VIDEO_OUTPUT_LEVEL = os.getenv("VIDEO_OUTPUT_LEVEL", "4.0")
+VIDEO_OUTPUT_GOP_SECONDS = max(
+    1, int(os.getenv("VIDEO_OUTPUT_GOP_SECONDS", "2"))
+)
 
 Path(VIDEO_OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 app = Flask(__name__)
@@ -97,6 +102,55 @@ _worker_lock = threading.Lock()
 
 def utc_now_iso() -> str:
     return datetime.utcnow().isoformat()
+
+
+def normalize_timestamp(value) -> float:
+    if value is None or value == "":
+        return float("inf")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("inf")
+
+
+def sort_item_value(item, key: str, default=None):
+    if item is None:
+        return default
+
+    try:
+        if isinstance(item, dict):
+            return item.get(key, default)
+        return item[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+
+
+def event_sort_key(item) -> tuple[float, float, str, str]:
+    start_time = normalize_timestamp(sort_item_value(item, "start_time"))
+    end_time = normalize_timestamp(sort_item_value(item, "end_time"))
+    updated_at = str(sort_item_value(item, "updated_at", "") or "")
+    event_id = str(sort_item_value(item, "id", "") or "")
+    return (start_time, end_time, updated_at, event_id)
+
+
+def normalize_manual_order(value) -> tuple[int, float]:
+    if value is None or value == "":
+        return (1, 0.0)
+    try:
+        return (0, float(value))
+    except (TypeError, ValueError):
+        return (1, 0.0)
+
+
+def display_event_sort_key(item) -> tuple[int, float, float, float, str, str]:
+    manual_rank, manual_order = normalize_manual_order(
+        sort_item_value(item, "manual_order")
+    )
+    start_time = normalize_timestamp(sort_item_value(item, "start_time"))
+    end_time = normalize_timestamp(sort_item_value(item, "end_time"))
+    updated_at = str(sort_item_value(item, "updated_at", "") or "")
+    event_id = str(sort_item_value(item, "id", "") or "")
+    return (manual_rank, manual_order, start_time, end_time, updated_at, event_id)
 
 
 def get_db_connection() -> sqlite3.Connection:
@@ -263,6 +317,7 @@ def init_db() -> None:
             metadata_threat_level INTEGER,
             visual_match INTEGER,
             visual_confidence REAL,
+            manual_order REAL,
             raw_json TEXT,
             updated_at TEXT
         )
@@ -277,6 +332,7 @@ def init_db() -> None:
         "incident_id": "ALTER TABLE events ADD COLUMN incident_id TEXT",
         "visual_match": "ALTER TABLE events ADD COLUMN visual_match INTEGER",
         "visual_confidence": "ALTER TABLE events ADD COLUMN visual_confidence REAL",
+        "manual_order": "ALTER TABLE events ADD COLUMN manual_order REAL",
     }
 
     for col, sql in event_migrations.items():
@@ -315,6 +371,7 @@ def init_db() -> None:
             video_updated_at TEXT,
             video_path TEXT,
             video_url TEXT,
+            manual_editing INTEGER,
             source_updated_at TEXT,
             created_at TEXT,
             updated_at TEXT
@@ -338,6 +395,7 @@ def init_db() -> None:
         "video_updated_at": "ALTER TABLE incidents ADD COLUMN video_updated_at TEXT",
         "video_path": "ALTER TABLE incidents ADD COLUMN video_path TEXT",
         "video_url": "ALTER TABLE incidents ADD COLUMN video_url TEXT",
+        "manual_editing": "ALTER TABLE incidents ADD COLUMN manual_editing INTEGER",
     }
 
     for col, sql in incident_migrations.items():
@@ -481,6 +539,32 @@ def download_clip(url: str, path: Path) -> bool:
         return False
 
 
+def build_h264_output_args() -> list[str]:
+    gop_size = max(1, VIDEO_OUTPUT_FPS * VIDEO_OUTPUT_GOP_SECONDS)
+    return [
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-pix_fmt",
+        "yuv420p",
+        "-profile:v",
+        VIDEO_OUTPUT_PROFILE,
+        "-level:v",
+        VIDEO_OUTPUT_LEVEL,
+        "-g",
+        str(gop_size),
+        "-keyint_min",
+        str(gop_size),
+        "-sc_threshold",
+        "0",
+        "-movflags",
+        "+faststart",
+    ]
+
+
 def normalize_clip_for_concat(input_path: Path, output_path: Path) -> tuple[bool, str | None]:
     cmd = [
         VIDEO_FFMPEG_BIN,
@@ -504,16 +588,11 @@ def normalize_clip_for_concat(input_path: Path, output_path: Path) -> tuple[bool
         ),
         "-r",
         str(VIDEO_OUTPUT_FPS),
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "23",
-        "-movflags",
-        "+faststart",
-        str(output_path),
     ]
+    cmd.extend(build_h264_output_args())
+    cmd.append(
+        str(output_path),
+    )
 
     try:
         subprocess.run(cmd, check=True, capture_output=True, text=True)
@@ -526,11 +605,46 @@ def normalize_clip_for_concat(input_path: Path, output_path: Path) -> tuple[bool
         return False, stderr[:500] if stderr else "normalize_failed"
 
 
-def write_concat_manifest(paths: list[Path], manifest_path: Path) -> None:
-    with manifest_path.open("w", encoding="utf-8") as f:
-        for path in paths:
-            escaped = str(path.resolve()).replace("'", "'\\''")
-            f.write(f"file '{escaped}'\n")
+def concatenate_normalized_clips(
+    input_paths: list[Path], output_path: Path
+) -> tuple[bool, str | None]:
+    if len(input_paths) < VIDEO_MIN_EVENTS:
+        return False, "not_enough_normalized_clips"
+
+    cmd = [VIDEO_FFMPEG_BIN, "-y"]
+    for path in input_paths:
+        cmd.extend(["-i", str(path)])
+
+    filter_parts = []
+    concat_inputs = []
+    for idx, _ in enumerate(input_paths):
+        filter_parts.append(
+            f"[{idx}:v]settb=AVTB,setpts=PTS-STARTPTS[v{idx}]"
+        )
+        concat_inputs.append(f"[v{idx}]")
+
+    filter_parts.append(
+        "".join(concat_inputs) + f"concat=n={len(input_paths)}:v=1:a=0[vout]"
+    )
+
+    cmd.extend(
+        [
+            "-filter_complex",
+            ";".join(filter_parts),
+            "-map",
+            "[vout]",
+        ]
+    )
+    cmd.extend(build_h264_output_args())
+    cmd.append(str(output_path))
+
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        return True, None
+    except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or "").strip()
+        print("[VIDEO] concat failed:", stderr)
+        return False, stderr[:500] if stderr else "concat_failed"
 
 
 def generate_incident_video(
@@ -540,7 +654,6 @@ def generate_incident_video(
         return False, "not_enough_events"
 
     temp_dir = Path(tempfile.mkdtemp(prefix=f"incident_video_{incident_id[:8]}_"))
-    concat_file = temp_dir / "concat.txt"
     output_file = Path(VIDEO_OUTPUT_DIR) / f"{incident_id}.mp4"
 
     try:
@@ -574,35 +687,9 @@ def generate_incident_video(
         if len(normalized_files) < VIDEO_MIN_EVENTS:
             return False, "download_failed"
 
-        write_concat_manifest(normalized_files, concat_file)
-
-        cmd = [
-            VIDEO_FFMPEG_BIN,
-            "-y",
-            "-fflags",
-            "+genpts",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            str(concat_file),
-            "-an",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "23",
-            "-pix_fmt",
-            "yuv420p",
-            "-movflags",
-            "+faststart",
-            str(output_file),
-        ]
-
-        print("[VIDEO] running:", " ".join(cmd))
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        success, error = concatenate_normalized_clips(normalized_files, output_file)
+        if not success:
+            return False, error
 
         return True, str(output_file)
 
@@ -968,9 +1055,7 @@ def call_incident_llm(
     if not LLM_BASE_URL or not LLM_MODEL:
         return None
 
-    ordered_events = sorted(
-        events_payload, key=lambda e: float(e.get("start_time") or 0)
-    )
+    ordered_events = sorted(events_payload, key=event_sort_key)
 
     compact_events = []
     for event in ordered_events:
@@ -1147,14 +1232,14 @@ def refresh_incident_record(conn: sqlite3.Connection, incident_id: str) -> None:
                label, score, severity, thumb_path,
                metadata_title, metadata_summary, metadata_scene,
                metadata_confidence, metadata_threat_level,
-               visual_match, visual_confidence,
+               visual_match, visual_confidence, manual_order,
                zones_json, objects_json, updated_at
         FROM events
         WHERE incident_id = ?
-        ORDER BY start_time ASC, updated_at ASC
         """,
         (incident_id,),
     ).fetchall()
+    event_rows = sorted(event_rows, key=display_event_sort_key)
 
     if not event_rows:
         conn.execute("DELETE FROM incidents WHERE incident_id = ?", (incident_id,))
@@ -1226,12 +1311,15 @@ def refresh_incident_record(conn: sqlite3.Connection, incident_id: str) -> None:
         SELECT llm_status, llm_updated_at, title_ai, summary_ai, behavior, severity,
                source_updated_at, created_at, llm_error,
                visual_status, visual_error, visual_updated_at, visual_confidence,
-               video_status, video_error, video_updated_at, video_path, video_url
+               video_status, video_error, video_updated_at, video_path, video_url,
+               manual_editing
         FROM incidents
         WHERE incident_id = ?
         """,
         (incident_id,),
     ).fetchone()
+
+    manual_editing = bool(existing_incident["manual_editing"]) if existing_incident else False
 
     visual_should_run = visual_validation_should_run(event_rows)
     visual_status = "pending" if visual_should_run else "skipped"
@@ -1329,6 +1417,20 @@ def refresh_incident_record(conn: sqlite3.Connection, incident_id: str) -> None:
             llm_updated_at = None
             llm_error = None
 
+    if manual_editing and existing_incident:
+        llm_status = existing_incident["llm_status"] or "waiting"
+        llm_updated_at = existing_incident["llm_updated_at"]
+        llm_error = existing_incident["llm_error"]
+        visual_status = existing_incident["visual_status"] or visual_status
+        visual_error = existing_incident["visual_error"]
+        visual_updated_at = existing_incident["visual_updated_at"]
+        visual_confidence = existing_incident["visual_confidence"]
+        video_status = existing_incident["video_status"] or video_status
+        video_error = existing_incident["video_error"]
+        video_updated_at = existing_incident["video_updated_at"]
+        video_path = existing_incident["video_path"]
+        video_url = existing_incident["video_url"]
+
     conn.execute(
         """
         INSERT INTO incidents (
@@ -1340,9 +1442,10 @@ def refresh_incident_record(conn: sqlite3.Connection, incident_id: str) -> None:
             llm_ready, llm_ready_reason,
             visual_status, visual_error, visual_updated_at, visual_confidence,
             video_status, video_error, video_updated_at, video_path, video_url,
+            manual_editing,
             source_updated_at, created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(incident_id) DO UPDATE SET
             start_time=excluded.start_time,
             end_time=excluded.end_time,
@@ -1372,6 +1475,7 @@ def refresh_incident_record(conn: sqlite3.Connection, incident_id: str) -> None:
             video_updated_at=excluded.video_updated_at,
             video_path=excluded.video_path,
             video_url=excluded.video_url,
+            manual_editing=excluded.manual_editing,
             source_updated_at=excluded.source_updated_at,
             updated_at=excluded.updated_at
         """,
@@ -1405,6 +1509,7 @@ def refresh_incident_record(conn: sqlite3.Connection, incident_id: str) -> None:
             video_updated_at,
             video_path,
             video_url,
+            1 if manual_editing else 0,
             source_updated_at,
             created_at,
             utc_now_iso(),
@@ -1415,21 +1520,240 @@ def refresh_incident_record(conn: sqlite3.Connection, incident_id: str) -> None:
 def refresh_waiting_incidents_to_pending() -> None:
     conn = get_db_connection()
     try:
-        waiting_rows = conn.execute(
+        rows_to_refresh = conn.execute(
             """
-            SELECT incident_id
-            FROM incidents
-            WHERE llm_status = 'waiting'
-                OR visual_status = 'pending'
-                OR video_status IS NULL
-                OR video_status = 'pending'
+            SELECT DISTINCT incident_id
+            FROM (
+                SELECT incident_id
+                FROM incidents
+                WHERE (
+                        llm_status = 'waiting'
+                        OR visual_status = 'pending'
+                        OR video_status IS NULL
+                        OR video_status = 'pending'
+                    )
+                  AND COALESCE(manual_editing, 0) = 0
+
+                UNION
+
+                SELECT e.incident_id
+                FROM events e
+                LEFT JOIN incidents i ON i.incident_id = e.incident_id
+                WHERE e.incident_id IS NOT NULL
+                  AND i.incident_id IS NULL
+            )
+            WHERE incident_id IS NOT NULL
             """
         ).fetchall()
 
-        for row in waiting_rows:
+        for row in rows_to_refresh:
             refresh_incident_record(conn, row["incident_id"])
 
         conn.commit()
+    finally:
+        conn.close()
+
+
+def reorder_event_in_incident(event_id: str, direction: int) -> dict | None:
+    conn = get_db_connection()
+    try:
+        row = conn.execute(
+            """
+            SELECT id, incident_id
+            FROM events
+            WHERE id = ?
+            """,
+            (event_id,),
+        ).fetchone()
+
+        if not row:
+            return None
+
+        incident_id = row["incident_id"]
+        if not incident_id:
+            raise ValueError("event_incident_missing")
+
+        event_rows = conn.execute(
+            """
+            SELECT id, incident_id, start_time, end_time, manual_order, updated_at
+            FROM events
+            WHERE incident_id = ?
+            """,
+            (incident_id,),
+        ).fetchall()
+
+        ordered_events = sorted(event_rows, key=display_event_sort_key)
+        event_ids = [str(item["id"]) for item in ordered_events]
+
+        try:
+            current_index = event_ids.index(str(event_id))
+        except ValueError:
+            return None
+
+        target_index = current_index + int(direction)
+        if target_index < 0 or target_index >= len(event_ids):
+            return {
+                "event_id": str(event_id),
+                "incident_id": str(incident_id),
+                "manual_order_changed": False,
+                "editing_incident_ids": [str(incident_id)],
+            }
+
+        moved_id = event_ids.pop(current_index)
+        event_ids.insert(target_index, moved_id)
+
+        timestamp = utc_now_iso()
+        for index, ordered_event_id in enumerate(event_ids, start=1):
+            conn.execute(
+                """
+                UPDATE events
+                SET manual_order = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (float(index), timestamp, ordered_event_id),
+            )
+
+        refresh_incident_record(conn, str(incident_id))
+        touched_ids = _set_incident_manual_editing(conn, [str(incident_id)], True)
+
+        conn.commit()
+        return {
+            "event_id": str(event_id),
+            "incident_id": str(incident_id),
+            "manual_order_changed": True,
+            "editing_incident_ids": touched_ids,
+        }
+    finally:
+        conn.close()
+
+
+def _set_incident_manual_editing(
+    conn: sqlite3.Connection, incident_ids: list[str], editing: bool
+) -> list[str]:
+    normalized_ids = []
+    for incident_id in incident_ids:
+        value = str(incident_id or "").strip()
+        if value and value not in normalized_ids:
+            normalized_ids.append(value)
+
+    if not normalized_ids:
+        return []
+
+    timestamp = utc_now_iso()
+    for incident_id in normalized_ids:
+        conn.execute(
+            """
+            INSERT INTO incidents (incident_id, manual_editing, updated_at, created_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(incident_id) DO UPDATE SET
+                manual_editing = excluded.manual_editing,
+                updated_at = excluded.updated_at
+            """,
+            (incident_id, 1 if editing else 0, timestamp, timestamp),
+        )
+
+        if editing:
+            continue
+
+        conn.execute(
+            """
+            UPDATE incidents
+            SET llm_status = CASE
+                    WHEN llm_ready = 1 THEN 'pending'
+                    ELSE 'waiting'
+                END,
+                llm_error = NULL,
+                llm_updated_at = NULL,
+                visual_status = CASE
+                    WHEN visual_status IN ('ready', 'pending', 'error') THEN 'pending'
+                    ELSE visual_status
+                END,
+                visual_error = NULL,
+                visual_updated_at = NULL,
+                visual_confidence = NULL,
+                video_status = CASE
+                    WHEN video_status IN ('ready', 'pending', 'error') OR video_status IS NULL THEN 'pending'
+                    ELSE video_status
+                END,
+                video_error = NULL,
+                video_updated_at = NULL,
+                video_path = NULL,
+                video_url = NULL,
+                updated_at = ?
+            WHERE incident_id = ?
+            """,
+            (timestamp, incident_id),
+        )
+
+        refresh_incident_record(conn, incident_id)
+
+    return normalized_ids
+
+
+def set_incident_manual_editing(incident_ids: list[str], editing: bool) -> list[str]:
+    conn = get_db_connection()
+    try:
+        result = _set_incident_manual_editing(conn, incident_ids, editing)
+        conn.commit()
+        return result
+    finally:
+        conn.close()
+
+
+def retry_incident_llm(incident_id: str) -> dict | None:
+    conn = get_db_connection()
+    try:
+        incident = conn.execute(
+            """
+            SELECT incident_id, manual_editing
+            FROM incidents
+            WHERE incident_id = ?
+            """,
+            (incident_id,),
+        ).fetchone()
+
+        if not incident:
+            return None
+
+        if incident["manual_editing"]:
+            raise ValueError("incident_editing_in_progress")
+
+        refresh_incident_record(conn, incident_id)
+
+        refreshed = conn.execute(
+            """
+            SELECT incident_id, llm_ready, llm_status
+            FROM incidents
+            WHERE incident_id = ?
+            """,
+            (incident_id,),
+        ).fetchone()
+
+        if not refreshed:
+            return None
+
+        next_status = "pending" if refreshed["llm_ready"] else "waiting"
+        conn.execute(
+            """
+            UPDATE incidents
+            SET llm_status = ?,
+                llm_error = NULL,
+                llm_updated_at = NULL,
+                updated_at = ?
+            WHERE incident_id = ?
+            """,
+            (next_status, utc_now_iso(), incident_id),
+        )
+        conn.commit()
+
+        if next_status == "pending":
+            process_pending_incidents_once()
+
+        return {
+            "incident_id": incident_id,
+            "llm_status": next_status,
+            "llm_ready": bool(refreshed["llm_ready"]),
+        }
     finally:
         conn.close()
 
@@ -1445,6 +1769,7 @@ def process_pending_visual_validation_once() -> None:
             SELECT incident_id
             FROM incidents
             WHERE visual_status = 'pending'
+              AND COALESCE(manual_editing, 0) = 0
             ORDER BY updated_at ASC
             LIMIT 5
             """
@@ -1456,13 +1781,13 @@ def process_pending_visual_validation_once() -> None:
             try:
                 rows = conn.execute(
                     """
-                    SELECT id, camera, start_time, thumb_path, updated_at, visual_match, visual_confidence
+                    SELECT id, camera, start_time, thumb_path, updated_at, visual_match, visual_confidence, manual_order
                     FROM events
                     WHERE incident_id = ?
-                    ORDER BY start_time ASC, updated_at ASC
                     """,
                     (incident_id,),
                 ).fetchall()
+                rows = sorted(rows, key=event_sort_key)
 
                 if not rows:
                     conn.execute(
@@ -1655,6 +1980,7 @@ def process_pending_incident_videos_once() -> None:
             SELECT incident_id, visual_status
             FROM incidents
             WHERE video_status = 'pending'
+              AND COALESCE(manual_editing, 0) = 0
             ORDER BY updated_at ASC
             LIMIT 10
             """
@@ -1666,13 +1992,13 @@ def process_pending_incident_videos_once() -> None:
             try:
                 event_rows = conn.execute(
                     """
-                    SELECT id, camera, start_time, end_time, visual_match
+                    SELECT id, camera, start_time, end_time, visual_match, manual_order, updated_at
                     FROM events
                     WHERE incident_id = ?
-                    ORDER BY start_time ASC, updated_at ASC
                     """,
                     (incident_id,),
                 ).fetchall()
+                event_rows = sorted(event_rows, key=event_sort_key)
 
                 if not event_rows or not video_generation_should_run(event_rows):
                     conn.execute(
@@ -1805,6 +2131,7 @@ def process_pending_incidents_once() -> None:
             FROM incidents
             WHERE llm_status = 'pending'
               AND llm_ready = 1
+              AND COALESCE(manual_editing, 0) = 0
             ORDER BY updated_at ASC
             LIMIT 5
             """
@@ -1820,14 +2147,14 @@ def process_pending_incidents_once() -> None:
                            label, score, severity, thumb_path,
                            metadata_title, metadata_summary, metadata_scene,
                            metadata_confidence, metadata_threat_level,
-                           visual_match, visual_confidence,
+                           visual_match, visual_confidence, manual_order,
                            zones_json, objects_json, updated_at
                     FROM events
                     WHERE incident_id = ?
-                    ORDER BY start_time ASC, updated_at ASC
                     """,
                     (incident_id,),
                 ).fetchall()
+                event_rows = sorted(event_rows, key=display_event_sort_key)
 
                 if not event_rows:
                     continue
@@ -2111,14 +2438,14 @@ def api_incidents():
                    label, score, severity, thumb_path,
                    metadata_title, metadata_summary, metadata_scene,
                    metadata_confidence, metadata_threat_level,
-                   visual_match, visual_confidence,
+                   visual_match, visual_confidence, manual_order,
                    zones_json, objects_json, updated_at
             FROM events
             WHERE incident_id = ?
-            ORDER BY start_time ASC, updated_at ASC
             """,
             (incident["incident_id"],),
         ).fetchall()
+        event_rows = sorted(event_rows, key=display_event_sort_key)
 
         all_events_payload = []
         visible_events_payload = []
@@ -2131,6 +2458,7 @@ def api_incidents():
                 "camera": row["camera"],
                 "start_time": row["start_time"],
                 "end_time": row["end_time"],
+                "manual_order": row["manual_order"],
                 "frigate_severity": row["frigate_severity"],
                 "label": row["label"],
                 "score": row["score"],
@@ -2196,6 +2524,7 @@ def api_incidents():
                 "video_status": incident["video_status"],
                 "video_error": incident["video_error"],
                 "video_url": incident["video_url"],
+                "manual_editing": bool(incident["manual_editing"]),
                 "excluded_event_count": excluded_event_count,
                 "cameras": visible_cameras,
                 "labels": json.loads(incident["labels_json"] or "[]"),
@@ -2253,6 +2582,103 @@ def api_worker_run():
     process_pending_incident_videos_once()
     process_pending_incidents_once()
     return jsonify({"status": "ok"})
+
+
+@app.route("/api/incidents/<incident_id>/rebuild", methods=["GET", "POST"])
+def api_rebuild_incident(incident_id):
+    conn = get_db_connection()
+    try:
+        event_count = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM events
+            WHERE incident_id = ?
+            """,
+            (incident_id,),
+        ).fetchone()["count"]
+
+        if not event_count:
+            return (
+                jsonify(
+                    {
+                        "status": "missing",
+                        "incident_id": incident_id,
+                        "message": "No events found for incident_id",
+                    }
+                ),
+                404,
+            )
+
+        refresh_incident_record(conn, incident_id)
+        conn.commit()
+
+        incident = conn.execute(
+            """
+            SELECT incident_id, event_count, start_time, end_time, llm_status,
+                   visual_status, video_status, updated_at
+            FROM incidents
+            WHERE incident_id = ?
+            """,
+            (incident_id,),
+        ).fetchone()
+
+        return jsonify(
+            {
+                "status": "rebuilt",
+                "incident": dict(incident) if incident else None,
+            }
+        )
+    finally:
+        conn.close()
+
+
+@app.route("/api/incidents/<incident_id>/retry-ai", methods=["POST"])
+def api_retry_incident_ai(incident_id):
+    try:
+        result = retry_incident_llm(incident_id)
+    except ValueError as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 400
+
+    if not result:
+        return jsonify({"status": "missing", "incident_id": incident_id}), 404
+
+    return jsonify({"status": "queued", **result})
+
+
+@app.route("/api/events/<event_id>/shift", methods=["POST"])
+def api_shift_event(event_id):
+    payload = request.get_json(silent=True) or {}
+
+    try:
+        direction = int(payload.get("direction", 0))
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "direction must be -1 or 1"}), 400
+
+    if direction not in (-1, 1):
+        return jsonify({"status": "error", "message": "direction must be -1 or 1"}), 400
+
+    try:
+        result = reorder_event_in_incident(event_id, direction)
+    except ValueError as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 400
+
+    if not result:
+        return jsonify({"status": "missing", "event_id": event_id}), 404
+
+    return jsonify({"status": "shifted", **result})
+
+
+@app.route("/api/incidents/editing", methods=["POST"])
+def api_set_incidents_editing():
+    payload = request.get_json(silent=True) or {}
+    incident_ids = payload.get("incident_ids") or []
+    editing = bool(payload.get("editing"))
+
+    if not isinstance(incident_ids, list):
+        return jsonify({"status": "error", "message": "incident_ids must be a list"}), 400
+
+    updated_ids = set_incident_manual_editing(incident_ids, editing)
+    return jsonify({"status": "ok", "incident_ids": updated_ids, "editing": editing})
 
 
 @app.route("/video/<incident_id>")
