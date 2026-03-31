@@ -118,26 +118,7 @@ ffmpeg -i input.mp4 -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -c:a 
 
 Clips are stitched using concat:
 
-ffmpeg -f concat -safe 0 -i list.txt -c copy output.mp4
-
----
-
-## ⚠️ Common Failure Modes
-
-- Black frames → bad decode or partial clip
-- Missing segments → clip not ready or HTTP failure
-- Ordering issues → incorrect timestamp sorting
-- Concat errors → mismatched codecs
-
----
-
-## 🧠 Recommended Strategy
-
-1. Validate clips exist
-2. Retry fetch
-3. Normalize clips
-4. Concatenate
-5. Skip bad clips if needed
+ffmpeg -y -i clip_01.mp4 -i clip_02.mp4 -filter_complex "[0:v]settb=AVTB,setpts=PTS-STARTPTS[v0];[1:v]settb=AVTB,setpts=PTS-STARTPTS[v1];[v0][v1]concat=n=2:v=1:a=0[vout]" -map "[vout]" -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -movflags +faststart stitched_incident.mp4
 
 ---
 
@@ -162,7 +143,6 @@ curl http://localhost:5001/api/worker/run
 
 # 🐳 Docker Notes
 
-- FFmpeg must be installed in container
 - Use volume mapping for videos:
 
 ./incident_videos:/app/incident_videos
@@ -176,15 +156,3 @@ curl http://localhost:5001/api/worker/run
 - /api/health
 
 ---
-
-# 🚀 Why This Matters
-
-Frigate gives detections.
-Frigate Signal gives narrative + stitched video context.
-
----
-
-# 👊 Final Take
-
-If video is wrong, the whole system breaks.
-The FFmpeg pipeline is the critical path.
