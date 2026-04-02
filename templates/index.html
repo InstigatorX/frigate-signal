@@ -211,6 +211,11 @@
       border-color: #4f77a1;
     }
 
+    .event-delete-btn {
+      padding-inline: 8px;
+      color: #fecaca;
+    }
+
     .event-shift-controls {
       display: inline-flex;
       align-items: center;
@@ -243,48 +248,6 @@
       font-size: 12px;
     }
 
-    .excluded-panel {
-      margin-top: 18px;
-      border-top: 1px solid var(--line);
-      padding-top: 18px;
-    }
-
-    .excluded-toggle {
-      width: 100%;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 10px;
-      background: rgba(17, 24, 39, 0.65);
-      color: var(--text);
-      border: 1px solid var(--line);
-      border-radius: 12px;
-      padding: 12px 14px;
-      cursor: pointer;
-      font-size: 13px;
-      font-weight: 700;
-      text-align: left;
-    }
-
-    .excluded-toggle-label {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-    }
-
-    .excluded-count {
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 600;
-    }
-
-    .excluded-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-      gap: 14px;
-      margin-top: 14px;
-    }
-
     .excluded-card {
       border: 1px dashed #5b647a;
       background: rgba(12, 18, 31, 0.72);
@@ -294,6 +257,40 @@
     .excluded-card .event-thumb,
     .excluded-card .event-thumb-placeholder {
       filter: grayscale(0.35);
+    }
+
+    .event-state-chip {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 3px 8px;
+      font-size: 10px;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      background: rgba(127, 29, 29, 0.32);
+      color: #fecaca;
+    }
+
+    .event-state-chip.interactive {
+      border: 1px solid rgba(248, 113, 113, 0.28);
+      cursor: pointer;
+    }
+
+    .event-state-chip.override {
+      background: rgba(6, 95, 70, 0.28);
+      color: #a7f3d0;
+    }
+
+    .event-exclusion-reason {
+      margin-top: 10px;
+      padding: 9px 10px;
+      border-radius: 10px;
+      border: 1px solid rgba(248, 113, 113, 0.2);
+      background: rgba(127, 29, 29, 0.12);
+      color: #fecaca;
+      font-size: 12px;
+      line-height: 1.4;
     }
 
     .pill {
@@ -712,6 +709,13 @@
       margin-bottom: 6px;
     }
 
+    .event-head-main {
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+
     .event-camera {
       font-weight: 700;
       font-size: calc(15px * var(--timeline-font-scale));
@@ -724,7 +728,6 @@
       color: var(--muted);
       font-size: calc(12px * var(--timeline-font-scale));
       white-space: nowrap;
-      flex: 0 0 auto;
     }
 
     .event-sub {
@@ -1016,8 +1019,8 @@
     let editingEventId = null;
     let shiftingEventId = null;
     let editingIncidentIds = [];
+    let dirtyEditingIncidentIds = [];
     let retryingAiIncidentId = null;
-    let showExcludedEvents = false;
     let savingEditSession = false;
     let refreshTimerId = null;
 
@@ -1300,14 +1303,45 @@
       window.open(url, "_blank", "noopener,noreferrer");
     }
 
-    function toggleEventEditor(eventId) {
-      editingEventId = editingEventId === eventId ? null : eventId;
-      renderSelectedIncident();
+    function handleEventCardClick(event, url) {
+      if (currentIncidentIsEditing(currentIncident)) return;
+      if (event?.target?.closest?.("button, a")) return;
+      openReview(url);
     }
 
-    function toggleExcludedEvents() {
-      showExcludedEvents = !showExcludedEvents;
-      renderSelectedIncident();
+    async function toggleEventEditor(eventId) {
+      const nextEventId = editingEventId === eventId ? null : eventId;
+      editingEventId = nextEventId;
+
+      if (!nextEventId || !currentIncident?.incident_id || currentIncidentIsEditing(currentIncident)) {
+        renderSelectedIncident();
+        return;
+      }
+
+      try {
+        const res = await fetch("/api/incidents/editing", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            incident_ids: [currentIncident.incident_id],
+            editing: true
+          })
+        });
+
+        if (!res.ok) {
+          const payload = await res.json().catch(() => ({}));
+          throw new Error(payload.message || `Start editing failed with status ${res.status}`);
+        }
+
+        const payload = await res.json();
+        addEditingIncidentIds(payload.incident_ids || [currentIncident.incident_id]);
+        await refreshIncidents({ forceRender: true });
+      } catch (error) {
+        console.error("Failed to start edit session", error);
+        window.alert(`Failed to enter edit mode: ${error.message}`);
+      } finally {
+        renderSelectedIncident();
+      }
     }
 
     function addEditingIncidentIds(ids) {
@@ -1319,9 +1353,65 @@
       });
     }
 
+    function addDirtyEditingIncidentIds(ids) {
+      if (!Array.isArray(ids) || !ids.length) return;
+      ids.forEach((incidentId) => {
+        if (incidentId && !dirtyEditingIncidentIds.includes(incidentId)) {
+          dirtyEditingIncidentIds.push(incidentId);
+        }
+      });
+    }
+
     function currentIncidentIsEditing(incident) {
       if (!incident) return false;
       return Boolean(incident.manual_editing) || editingIncidentIds.includes(incident.incident_id);
+    }
+
+    function isVisuallyExcludedEvent(incident, event) {
+      return Boolean(
+        incident
+        && incident.visual_status === "ready"
+        && !event?.visual_manual_override
+        && Number(event?.visual_match) === 0
+      );
+    }
+
+    function visualExclusionReason(event) {
+      const confidenceText = event?.visual_confidence != null
+        ? `Confidence: ${fmtConfidence(event.visual_confidence)}`
+        : "Confidence unavailable";
+      const reasonText = event?.visual_exclusion_reason;
+
+      return reasonText
+        ? `${confidenceText}. ${reasonText}`
+        : confidenceText;
+    }
+
+    async function overrideVisualExclusion(eventId) {
+      if (!eventId) return;
+      if (!currentIncidentIsEditing(currentIncident)) {
+        window.alert("Enter edit mode first, then click the excluded badge to include this event.");
+        return;
+      }
+
+      try {
+        const res = await fetch(`/api/events/${encodeURIComponent(eventId)}/override-visual`, {
+          method: "POST"
+        });
+
+        if (!res.ok) {
+          const payload = await res.json().catch(() => ({}));
+          throw new Error(payload.message || `Override failed with status ${res.status}`);
+        }
+
+        const payload = await res.json();
+        addEditingIncidentIds(payload.editing_incident_ids || [payload.incident_id]);
+        addDirtyEditingIncidentIds(payload.editing_incident_ids || [payload.incident_id]);
+        await refreshIncidents({ forceRender: true });
+      } catch (error) {
+        console.error("Failed to override visual exclusion", error);
+        window.alert(`Failed to include event: ${error.message}`);
+      }
     }
 
     async function shiftEvent(eventId, direction) {
@@ -1343,6 +1433,7 @@
 
         const payload = await res.json();
         addEditingIncidentIds(payload.editing_incident_ids || [payload.old_incident_id, payload.incident_id]);
+        addDirtyEditingIncidentIds(payload.editing_incident_ids || [payload.old_incident_id, payload.incident_id]);
 
         await refreshIncidents({ forceRender: true });
       } catch (error) {
@@ -1354,17 +1445,56 @@
       }
     }
 
-    async function completeEditSession() {
+    async function removeEventFromTimeline(eventId) {
+      if (!eventId) return;
+      if (!currentIncident?.incident_id || !currentIncidentIsEditing(currentIncident)) {
+        window.alert("Enter edit mode first, then remove timeline events.");
+        return;
+      }
+
+      const confirmed = window.confirm("Remove this event from the timeline?");
+      if (!confirmed) return;
+
+      try {
+        const res = await fetch(`/api/events/${encodeURIComponent(eventId)}/remove`, {
+          method: "POST"
+        });
+
+        if (!res.ok) {
+          const payload = await res.json().catch(() => ({}));
+          throw new Error(payload.message || `Remove failed with status ${res.status}`);
+        }
+
+        const payload = await res.json();
+        addEditingIncidentIds(payload.editing_incident_ids || [payload.incident_id]);
+        addDirtyEditingIncidentIds(payload.editing_incident_ids || [payload.incident_id]);
+
+        if (eventId === editingEventId) {
+          editingEventId = null;
+        }
+
+        await refreshIncidents({ forceRender: true });
+      } catch (error) {
+        console.error("Failed to remove event", error);
+        window.alert(`Failed to remove event: ${error.message}`);
+      }
+    }
+
+    async function completeEditSession(reprocess = true) {
       if (!editingIncidentIds.length || savingEditSession) return;
 
       savingEditSession = true;
       try {
+        const incidentIds = [...editingIncidentIds];
+        const dirtyIds = [...dirtyEditingIncidentIds];
+        const shouldReprocess = reprocess && dirtyIds.length > 0;
         const res = await fetch("/api/incidents/editing", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            incident_ids: editingIncidentIds,
-            editing: false
+            incident_ids: incidentIds,
+            editing: false,
+            reprocess: shouldReprocess
           })
         });
 
@@ -1374,6 +1504,7 @@
         }
 
         editingIncidentIds = [];
+        dirtyEditingIncidentIds = [];
         editingEventId = null;
         await refreshIncidents({ forceRender: true });
       } catch (error) {
@@ -1442,7 +1573,10 @@
           event_type: event.event_type,
           frigate_severity: event.frigate_severity,
           label: event.label,
+          visual_match: event.visual_match,
           visual_confidence: event.visual_confidence,
+          visual_exclusion_reason: event.visual_exclusion_reason,
+          visual_manual_override: event.visual_manual_override,
           title: event.title,
           summary: event.summary
         }))
@@ -1520,13 +1654,105 @@
       currentIncident = incident;
 
       const events = [...(incident.events || [])].sort(compareEvents);
-      const visibleEventIds = new Set(events.map((event) => String(event.id || "")));
-      const excludedEvents = [...(incident.all_events || [])]
-        .filter((event) => !visibleEventIds.has(String(event.id || "")))
-        .sort(compareEvents);
       const horizontal = incident.horizontal_path || [];
       const summaryText = summaryTextForIncident(incident);
       const summaryClass = summaryClassForIncident(incident);
+      const editModeActive = currentIncidentIsEditing(incident);
+      const excludedCount = events.filter((event) => isVisuallyExcludedEvent(incident, event)).length;
+      const renderedEvents = events.map((event) => {
+        const excluded = isVisuallyExcludedEvent(incident, event);
+        const exclusionReason = excluded ? visualExclusionReason(event) : "";
+
+        return `
+          <div class="timeline-step-wrap">
+            <div class="event-card clickable ${excluded ? "excluded-card" : ""}" onclick="handleEventCardClick(event, '${escapeHtml(event.review_url || "#")}')">
+              ${event.thumb_url
+                ? `
+                    <a class="event-thumb-link" href="${escapeHtml(event.review_url || "#")}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">
+                      <img class="event-thumb" src="${escapeHtml(event.thumb_url)}" alt="Thumbnail for ${escapeHtml(event.camera || "event")}" />
+                    </a>
+                  `
+                : `<div class="event-thumb-placeholder">No thumbnail</div>`
+              }
+
+              <div class="event-body">
+                <div class="event-head">
+                  <div class="event-head-main">
+                    <div class="event-camera">${escapeHtml(event.camera || "unknown camera")}</div>
+                    <div class="event-time">${escapeHtml(fmtShortTime(event.start_time))}</div>
+                  </div>
+                  <div class="event-actions">
+                    <button
+                      type="button"
+                      class="event-edit-btn ${editingEventId === event.id ? "active" : ""}"
+                      onclick="event.stopPropagation(); toggleEventEditor('${escapeHtml(event.id || "")}')"
+                    >
+                      Edit
+                    </button>
+                    ${editModeActive ? `
+                      <button
+                        type="button"
+                        class="event-edit-btn event-delete-btn"
+                        onclick="event.stopPropagation(); removeEventFromTimeline('${escapeHtml(event.id || "")}')"
+                        title="Remove this event from the timeline"
+                      >
+                        🗑
+                      </button>
+                    ` : ``}
+                    <div class="event-shift-controls" ${editingEventId === event.id ? "" : "hidden"}>
+                      <button
+                        type="button"
+                        class="event-shift-btn"
+                        onclick="event.stopPropagation(); shiftEvent('${escapeHtml(event.id || "")}', -1)"
+                        ${shiftingEventId === event.id ? "disabled" : ""}
+                        title="Move earlier in sequence"
+                      >
+                        ←
+                      </button>
+                      <button
+                        type="button"
+                        class="event-shift-btn"
+                        onclick="event.stopPropagation(); shiftEvent('${escapeHtml(event.id || "")}', 1)"
+                        ${shiftingEventId === event.id ? "disabled" : ""}
+                        title="Move later in sequence"
+                      >
+                        →
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="event-sub">
+                  ${excluded
+                    ? editModeActive
+                      ? `<button type="button" class="event-state-chip interactive" onclick="event.stopPropagation(); overrideVisualExclusion('${escapeHtml(event.id || "")}')">Visually Excluded</button> · `
+                      : `<span class="event-state-chip" title="Enter edit mode to include this event">Visually Excluded</span> · `
+                    : ``}
+                  ${event.visual_manual_override ? `<span class="event-state-chip override">Manual Override</span> · ` : ``}
+                  ${escapeHtml(event.event_type || "event")} ·
+                  ${escapeHtml(event.frigate_severity || "n/a")} ·
+                  ${escapeHtml(event.label || "unknown")}
+                  ${!excluded && event.visual_confidence != null ? ` · visual ${escapeHtml(fmtConfidence(event.visual_confidence))}` : ``}
+                </div>
+
+                <div class="event-text">
+                  <strong>${escapeHtml(event.title || event.label || "Event")}</strong>
+                  ${event.summary ? `
+                    <div class="event-hover-detail">
+                      ${escapeHtml(event.summary)}
+                    </div>
+                  ` : ``}
+                  ${excluded ? `
+                    <div class="event-exclusion-reason">
+                      ${escapeHtml(exclusionReason)}
+                    </div>
+                  ` : ``}
+                </div>
+              </div>
+            </div>
+          </div>
+        `;
+      }).join("");
 
       let visualNotice = "";
       if (incident.visual_status === "pending") {
@@ -1536,8 +1762,8 @@
       }
 
       let excludedNotice = "";
-      if ((incident.excluded_event_count || 0) > 0) {
-        excludedNotice = `<div class="notice visual">${escapeHtml(String(incident.excluded_event_count))} event(s) were excluded from the visible timeline after visual validation.</div>`;
+      if (excludedCount > 0) {
+        excludedNotice = `<div class="notice visual">${escapeHtml(String(excludedCount))} event(s) failed visual validation and were added back to the timeline with an exclusion note.</div>`;
       }
 
       let videoNotice = "";
@@ -1611,7 +1837,15 @@
                   <button
                     type="button"
                     class="timeline-edit-btn"
-                    onclick="completeEditSession()"
+                    onclick="completeEditSession(false)"
+                    ${savingEditSession ? "disabled" : ""}
+                  >
+                    Exit Editing
+                  </button>
+                  <button
+                    type="button"
+                    class="timeline-edit-btn"
+                    onclick="completeEditSession(true)"
                     ${savingEditSession ? "disabled" : ""}
                   >
                     Done Editing
@@ -1631,129 +1865,8 @@
             </div>
             <div class="timeline-scroll">
               <div class="timeline" style="--events-per-row:${getEventsPerRow()}; --timeline-font-scale:${getTimelineFontScale()}">
-                ${events.map((event) => `
-                  <div class="timeline-step-wrap">
-                    <div class="event-card clickable" onclick="openReview('${escapeHtml(event.review_url || "#")}')">
-                      ${event.thumb_url
-          ? `
-                          <a class="event-thumb-link" href="${escapeHtml(event.review_url || "#")}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">
-                            <img class="event-thumb" src="${escapeHtml(event.thumb_url)}" alt="Thumbnail for ${escapeHtml(event.camera || "event")}" />
-                          </a>
-                        `
-          : `<div class="event-thumb-placeholder">No thumbnail</div>`
-        }
-
-                      <div class="event-body">
-                        <div class="event-head">
-                          <div class="event-camera">${escapeHtml(event.camera || "unknown camera")}</div>
-                          <div class="event-time">${escapeHtml(fmtShortTime(event.start_time))}</div>
-                          <div class="event-actions">
-                            <button
-                              type="button"
-                              class="event-edit-btn ${editingEventId === event.id ? "active" : ""}"
-                              onclick="event.stopPropagation(); toggleEventEditor('${escapeHtml(event.id || "")}')"
-                            >
-                              Edit
-                            </button>
-                            <div class="event-shift-controls" ${editingEventId === event.id ? "" : "hidden"}>
-                              <button
-                                type="button"
-                                class="event-shift-btn"
-                                onclick="event.stopPropagation(); shiftEvent('${escapeHtml(event.id || "")}', -1)"
-                                ${shiftingEventId === event.id ? "disabled" : ""}
-                                title="Move earlier in sequence"
-                              >
-                                ←
-                              </button>
-                              <button
-                                type="button"
-                                class="event-shift-btn"
-                                onclick="event.stopPropagation(); shiftEvent('${escapeHtml(event.id || "")}', 1)"
-                                ${shiftingEventId === event.id ? "disabled" : ""}
-                                title="Move later in sequence"
-                              >
-                                →
-                              </button>
-                            </div>
-                          </div>
-                        </div>
-
-                        <div class="event-sub">
-                          ${escapeHtml(event.event_type || "event")} ·
-                          ${escapeHtml(event.frigate_severity || "n/a")} ·
-                          ${escapeHtml(event.label || "unknown")}
-                          ${event.visual_confidence != null ? ` · visual ${escapeHtml(fmtConfidence(event.visual_confidence))}` : ``}
-                        </div>
-
-                        <div class="event-text">
-                          <strong>${escapeHtml(event.title || event.label || "Event")}</strong>
-                          ${event.summary ? `
-                            <div class="event-hover-detail">
-                              ${escapeHtml(event.summary)}
-                            </div>
-                          ` : ``}
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                `).join("")}
+                ${renderedEvents}
               </div>
-
-              ${excludedEvents.length ? `
-                <div class="excluded-panel">
-                  <button
-                    type="button"
-                    class="excluded-toggle"
-                    onclick="toggleExcludedEvents()"
-                  >
-                    <span class="excluded-toggle-label">
-                      <span>${showExcludedEvents ? "Hide" : "Show"} Excluded Events</span>
-                      <span class="excluded-count">${excludedEvents.length} hidden after visual validation</span>
-                    </span>
-                    <span>${showExcludedEvents ? "▾" : "▸"}</span>
-                  </button>
-
-                  ${showExcludedEvents ? `
-                    <div class="excluded-grid">
-                      ${excludedEvents.map((event) => `
-                        <div class="event-card excluded-card">
-                          ${event.thumb_url
-                            ? `
-                                <a class="event-thumb-link" href="${escapeHtml(event.review_url || "#")}" target="_blank" rel="noopener noreferrer">
-                                  <img class="event-thumb" src="${escapeHtml(event.thumb_url)}" alt="Thumbnail for ${escapeHtml(event.camera || "event")}" />
-                                </a>
-                              `
-                            : `<div class="event-thumb-placeholder">No thumbnail</div>`
-                          }
-
-                          <div class="event-body">
-                            <div class="event-head">
-                              <div class="event-camera">${escapeHtml(event.camera || "unknown camera")}</div>
-                              <div class="event-time">${escapeHtml(fmtShortTime(event.start_time))}</div>
-                            </div>
-
-                            <div class="event-sub">
-                              excluded ·
-                              ${escapeHtml(event.event_type || "event")} ·
-                              ${escapeHtml(event.label || "unknown")}
-                              ${event.visual_confidence != null ? ` · visual ${escapeHtml(fmtConfidence(event.visual_confidence))}` : ``}
-                            </div>
-
-                            <div class="event-text">
-                              <strong>${escapeHtml(event.title || event.label || "Event")}</strong>
-                              ${event.summary ? `
-                                <div class="event-hover-detail">
-                                  ${escapeHtml(event.summary)}
-                                </div>
-                              ` : ``}
-                            </div>
-                          </div>
-                        </div>
-                      `).join("")}
-                    </div>
-                  ` : ``}
-                </div>
-              ` : ``}
             </div>
           </div>
         </section>

@@ -19,33 +19,84 @@
       "foyer"
     ]
   },
-
   "adjacency": {
-    "gate": ["lower_garage", "back_left"],
-    "lower_garage": ["gate", "upper_garage", "back_left"],
-    "front_door": ["upper_garage", "front_side"],
-    "front_side": ["front_door", "upper_garage", "back_right"],
-    "upper_garage": ["front_side", "upper_side", "front_door", "lower_garage", "steve_garage"],
-    "upper_side": ["upper_garage"],
-    "steve_garage": ["upper_garage"],
-
-    "back_right": ["back_middle"],
-    "back_middle": ["back_right", "back_left"],
-    "back_left": ["back_middle", "lower_garage", "gate"]
+    "gate": [
+      "lower_garage",
+      "back_left"
+    ],
+    "lower_garage": [
+      "gate",
+      "upper_garage",
+      "back_left"
+    ],
+    "front_door": [
+      "upper_garage",
+      "front_side"
+    ],
+    "front_side": [
+      "front_door",
+      "upper_garage",
+      "back_right"
+    ],
+    "upper_garage": [
+      "front_side",
+      "upper_side",
+      "front_door",
+      "lower_garage",
+      "steve_garage"
+    ],
+    "upper_side": [
+      "upper_garage"
+    ],
+    "steve_garage": [
+      "upper_garage"
+    ],
+    "back_right": [
+      "back_middle",
+      "front_side"
+    ],
+    "back_middle": [
+      "back_right",
+      "back_left"
+    ],
+    "back_left": [
+      "back_middle",
+      "lower_garage",
+      "gate"
+    ]
   },
-
   "hard_boundaries": [
-    ["gate", "downstairs"],
-    ["back_right", "front_door"],
-    ["back_middle", "front_door"],
-    ["back_left", "front_door"],
-    ["back_right", "gate"],
-    ["back_middle", "gate"],
-    ["downstairs", "back_right"],
-    ["downstairs", "back_middle"],
-    ["downstairs", "back_left"],
-    ["foyer", "back_right"],
-    ["foyer", "back_middle"],
-    ["foyer", "back_left"]
+    [
+      "downstairs",
+      "gate"
+    ],
+    [
+      "downstairs",
+      "back_right"
+    ],
+    [
+      "downstairs",
+      "back_middle"
+    ],
+    [
+      "downstairs",
+      "back_left"
+    ],
+    [
+      "foyer",
+      "gate"
+    ],
+    [
+      "foyer",
+      "back_right"
+    ],
+    [
+      "foyer",
+      "back_middle"
+    ],
+    [
+      "foyer",
+      "back_left"
+    ]
   ]
 }

@@ -33,6 +33,11 @@ FRIGATE_VOD_BASE = os.getenv("FRIGATE_VOD_BASE", FRIGATE_PUBLIC_BASE + "/api")
 
 INCIDENT_WINDOW_SECONDS = int(os.getenv("INCIDENT_WINDOW_SECONDS", "30"))
 INCIDENT_LLM_IDLE_SECONDS = int(os.getenv("INCIDENT_LLM_IDLE_SECONDS", "15"))
+INCIDENT_MIN_EVENTS = max(1, int(os.getenv("INCIDENT_MIN_EVENTS", "3")))
+INCIDENT_MIN_EVENTS_PRUNE_SECONDS = max(
+    INCIDENT_WINDOW_SECONDS,
+    int(os.getenv("INCIDENT_MIN_EVENTS_PRUNE_SECONDS", str(INCIDENT_WINDOW_SECONDS))),
+)
 
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "").rstrip("/")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "dummy")
@@ -43,6 +48,9 @@ TOPOLOGY_PATH = os.getenv("TOPOLOGY_PATH", "camera_topology.json")
 TOPOLOGY_MAX_HOPS = int(os.getenv("TOPOLOGY_MAX_HOPS", "2"))
 
 PROMPT_PATH = os.getenv("PROMPT_PATH", "incident_prompt.txt")
+VISUAL_PROMPT_PATH = os.getenv(
+    "VISUAL_PROMPT_PATH", "visual_validation_prompt.txt"
+)
 
 INCIDENT_WORKER_ENABLED = os.getenv("INCIDENT_WORKER_ENABLED", "true").lower() in (
     "1",
@@ -71,6 +79,19 @@ VISUAL_VALIDATION_MODEL = os.getenv("VISUAL_VALIDATION_MODEL", LLM_MODEL)
 VISUAL_VALIDATION_MIN_EVENTS = int(os.getenv("VISUAL_VALIDATION_MIN_EVENTS", "3"))
 VISUAL_VALIDATION_MAX_IMAGES = int(os.getenv("VISUAL_VALIDATION_MAX_IMAGES", "6"))
 VISUAL_VALIDATION_THRESHOLD = float(os.getenv("VISUAL_VALIDATION_THRESHOLD", "0.45"))
+VISUAL_VALIDATION_ADJACENT_THRESHOLD = float(
+    os.getenv("VISUAL_VALIDATION_ADJACENT_THRESHOLD", "0.35")
+)
+INCIDENT_RECONCILIATION_ENABLED = os.getenv(
+    "INCIDENT_RECONCILIATION_ENABLED", "true"
+).lower() in ("1", "true", "yes", "on")
+INCIDENT_RECONCILIATION_RECENT_SECONDS = max(
+    INCIDENT_WINDOW_SECONDS,
+    int(os.getenv("INCIDENT_RECONCILIATION_RECENT_SECONDS", "21600")),
+)
+INCIDENT_RECONCILIATION_MAX_EVENTS = max(
+    10, int(os.getenv("INCIDENT_RECONCILIATION_MAX_EVENTS", "200"))
+)
 
 VIDEO_GENERATION_ENABLED = os.getenv("VIDEO_GENERATION_ENABLED", "true").lower() in (
     "1",
@@ -102,6 +123,22 @@ _worker_lock = threading.Lock()
 
 def utc_now_iso() -> str:
     return datetime.utcnow().isoformat()
+
+
+def parse_iso_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except Exception:
+        return None
+
+
+def incident_meets_minimum_event_count(event_count: int | None) -> bool:
+    try:
+        return int(event_count or 0) >= INCIDENT_MIN_EVENTS
+    except Exception:
+        return False
 
 
 def normalize_timestamp(value) -> float:
@@ -209,8 +246,44 @@ def load_system_prompt() -> str:
         )
 
 
+def visual_validation_prompt_fallback() -> str:
+    return (
+        "You are validating whether a surveillance event image belongs to the same subject as a recent chain of reference images. "
+        "Use the reference images as a short movement history ordered in time. "
+        "Decide whether the candidate image likely continues that same subject track. "
+        "Account for the provided camera topology note when scoring plausibility: "
+        "same camera and adjacent cameras support a match, connected cameras within a few hops are plausible, "
+        "and hard boundaries or disconnected cameras should lower confidence substantially. "
+        "Treat detection labels as noisy optional hints, not ground truth for identity. A generic label and a more specific label can still refer to the same subject, "
+        "such as a generic vehicle label versus a delivery-brand, fleet, company, subtype, or descriptive label, or a general person label versus a named, uniformed, role-based, or descriptive person label. "
+        "Do not treat differences in label specificity, branding, subtype, role, naming, or detector wording as negative evidence by themselves when the images, timing, and topology remain consistent. "
+        "Only treat a label difference as meaningful if the images indicate a true subject-class mismatch or a physically implausible transition. "
+        "Do not over-weight color alone for vehicles or clothing because surveillance images can shift appearance due to angle, shadow, glare, IR, compression, and front/rear/side views. "
+        "Prioritize track continuity, shape, size, and movement plausibility over small color changes. "
+        "Be conservative. If uncertain due to angle, distance, or occlusion, prefer low confidence rather than a false match. "
+        'Return ONLY raw JSON with this format: {"match":true,"confidence":0.0,"reason":"short explanation"}'
+    )
+
+
+def load_visual_system_prompt() -> str:
+    path = Path(VISUAL_PROMPT_PATH)
+    if not path.exists():
+        print(f"[VISUAL PROMPT] file not found: {path}, using fallback")
+        return visual_validation_prompt_fallback()
+
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            prompt = f.read().strip()
+        print(f"[VISUAL PROMPT] loaded from {path}")
+        return prompt
+    except Exception as e:
+        print(f"[VISUAL PROMPT] failed to load {path}: {e}")
+        return visual_validation_prompt_fallback()
+
+
 TOPOLOGY = load_topology()
 SYSTEM_PROMPT = load_system_prompt()
+VISUAL_SYSTEM_PROMPT = load_visual_system_prompt()
 
 
 def refresh_topology() -> None:
@@ -221,6 +294,11 @@ def refresh_topology() -> None:
 def refresh_system_prompt() -> None:
     global SYSTEM_PROMPT
     SYSTEM_PROMPT = load_system_prompt()
+
+
+def refresh_visual_system_prompt() -> None:
+    global VISUAL_SYSTEM_PROMPT
+    VISUAL_SYSTEM_PROMPT = load_visual_system_prompt()
 
 
 def build_hard_boundary_set(topology: dict) -> set[tuple[str, str]]:
@@ -290,6 +368,76 @@ def cameras_are_correlatable(cam_a: str, cam_b: str, topology: dict) -> bool:
     return cameras_have_path(cam_a, cam_b, topology, max_hops=TOPOLOGY_MAX_HOPS)
 
 
+def describe_camera_topology(cam_a: str | None, cam_b: str | None, topology: dict) -> str:
+    if not cam_a or not cam_b:
+        return "topology unknown"
+    if cam_a == cam_b:
+        return "same camera"
+    if cameras_in_hard_boundary(cam_a, cam_b, topology):
+        return "hard boundary between cameras"
+
+    adjacent_from_a = get_adjacent_cameras(cam_a, topology)
+    adjacent_from_b = get_adjacent_cameras(cam_b, topology)
+    if cam_b in adjacent_from_a or cam_a in adjacent_from_b:
+        return "adjacent cameras"
+
+    if cameras_have_path(cam_a, cam_b, topology, max_hops=TOPOLOGY_MAX_HOPS):
+        return f"connected within {TOPOLOGY_MAX_HOPS} hops"
+
+    return f"not connected within {TOPOLOGY_MAX_HOPS} hops"
+
+
+def visual_validation_threshold_for(
+    reference_events: list[dict], candidate_event: dict
+) -> float:
+    base_threshold = VISUAL_VALIDATION_THRESHOLD
+    if not reference_events:
+        return base_threshold
+
+    latest_reference = reference_events[-1]
+    topology_note = describe_camera_topology(
+        latest_reference.get("camera"), candidate_event.get("camera"), TOPOLOGY
+    )
+    if topology_note in {"same camera", "adjacent cameras"}:
+        return min(base_threshold, VISUAL_VALIDATION_ADJACENT_THRESHOLD)
+    return base_threshold
+
+
+def labels_are_visually_compatible(label_a: str | None, label_b: str | None) -> bool:
+    normalized_a = normalize_label(label_a)
+    normalized_b = normalize_label(label_b)
+
+    if "unknown" in {normalized_a, normalized_b}:
+        return True
+    if normalized_a == normalized_b:
+        return True
+
+    compatible_pairs = {
+        frozenset({"car", "person"}),
+    }
+    return frozenset({normalized_a, normalized_b}) in compatible_pairs
+
+
+def label_can_anchor_reference(
+    anchor_label: str | None, reference_label: str | None, candidate_label: str | None
+) -> bool:
+    normalized_anchor = normalize_label(anchor_label)
+    normalized_reference = normalize_label(reference_label)
+    normalized_candidate = normalize_label(candidate_label)
+
+    if "unknown" in {normalized_reference, normalized_candidate}:
+        return True
+    if normalized_reference == normalized_candidate:
+        return True
+
+    # Keep compatible mixed-label events in the incident, but avoid using them
+    # as the primary visual reference for later same-object comparisons.
+    if normalized_candidate == normalized_anchor and normalized_reference != normalized_anchor:
+        return False
+
+    return labels_are_visually_compatible(normalized_reference, normalized_candidate)
+
+
 def init_db() -> None:
     conn = get_db_connection()
     c = conn.cursor()
@@ -317,6 +465,8 @@ def init_db() -> None:
             metadata_threat_level INTEGER,
             visual_match INTEGER,
             visual_confidence REAL,
+            visual_exclusion_reason TEXT,
+            visual_manual_override INTEGER,
             manual_order REAL,
             raw_json TEXT,
             updated_at TEXT
@@ -332,6 +482,8 @@ def init_db() -> None:
         "incident_id": "ALTER TABLE events ADD COLUMN incident_id TEXT",
         "visual_match": "ALTER TABLE events ADD COLUMN visual_match INTEGER",
         "visual_confidence": "ALTER TABLE events ADD COLUMN visual_confidence REAL",
+        "visual_exclusion_reason": "ALTER TABLE events ADD COLUMN visual_exclusion_reason TEXT",
+        "visual_manual_override": "ALTER TABLE events ADD COLUMN visual_manual_override INTEGER",
         "manual_order": "ALTER TABLE events ADD COLUMN manual_order REAL",
     }
 
@@ -812,6 +964,193 @@ def find_or_create_incident(conn: sqlite3.Connection, event: dict) -> str:
     return str(uuid.uuid4())
 
 
+def find_reconciliation_incident(
+    conn: sqlite3.Connection, event: dict, exclude_event_id: str | None = None
+) -> str | None:
+    label = normalize_label(event.get("label"))
+    camera = event.get("camera")
+    start_time = event.get("start_time")
+
+    if label == "unknown" or start_time is None:
+        return None
+
+    try:
+        start_time_val = float(start_time)
+    except (TypeError, ValueError):
+        return None
+
+    candidate_rows = conn.execute(
+        """
+        SELECT id, incident_id, camera, start_time, updated_at
+        FROM events
+        WHERE label = ?
+          AND start_time IS NOT NULL
+          AND incident_id IS NOT NULL
+          AND (? IS NULL OR id != ?)
+          AND ABS(start_time - ?) <= ?
+        ORDER BY ABS(start_time - ?) ASC, updated_at DESC
+        """,
+        (
+            label,
+            exclude_event_id,
+            exclude_event_id,
+            start_time_val,
+            INCIDENT_WINDOW_SECONDS,
+            start_time_val,
+        ),
+    ).fetchall()
+
+    for row in candidate_rows:
+        if row["camera"] == camera:
+            return str(row["incident_id"])
+
+    for row in candidate_rows:
+        if cameras_are_correlatable(row["camera"], camera, TOPOLOGY):
+            return str(row["incident_id"])
+
+    return None
+
+
+def merge_incidents(
+    conn: sqlite3.Connection, target_incident_id: str, source_incident_id: str
+) -> bool:
+    target = str(target_incident_id or "").strip()
+    source = str(source_incident_id or "").strip()
+    if not target or not source or target == source:
+        return False
+
+    source_count = conn.execute(
+        "SELECT COUNT(*) AS count FROM events WHERE incident_id = ?",
+        (source,),
+    ).fetchone()["count"]
+    if not source_count:
+        return False
+
+    timestamp = utc_now_iso()
+    conn.execute(
+        """
+        UPDATE events
+        SET incident_id = ?, updated_at = ?
+        WHERE incident_id = ?
+        """,
+        (target, timestamp, source),
+    )
+
+    refresh_incident_record(conn, target)
+    refresh_incident_record(conn, source)
+    return True
+
+
+def reconcile_incidents_once(
+    conn: sqlite3.Connection,
+    start_time: float | None = None,
+    end_time: float | None = None,
+    max_events: int | None = None,
+    dry_run: bool = False,
+) -> dict:
+    if not INCIDENT_RECONCILIATION_ENABLED and not dry_run:
+        return {
+            "enabled": False,
+            "inspected_events": 0,
+            "merge_candidates": 0,
+            "merged_incidents": [],
+        }
+
+    clauses = [
+        "incident_id IS NOT NULL",
+        "start_time IS NOT NULL",
+    ]
+    params: list[object] = []
+
+    if start_time is None:
+        start_time = max(0.0, time.time() - INCIDENT_RECONCILIATION_RECENT_SECONDS)
+    clauses.append("start_time >= ?")
+    params.append(float(start_time))
+
+    if end_time is not None:
+        clauses.append("start_time <= ?")
+        params.append(float(end_time))
+
+    limit = int(max_events or INCIDENT_RECONCILIATION_MAX_EVENTS)
+    params.append(limit)
+
+    rows = conn.execute(
+        f"""
+        SELECT id, incident_id, camera, label, start_time, updated_at
+        FROM events
+        WHERE {' AND '.join(clauses)}
+        ORDER BY start_time ASC, updated_at ASC
+        LIMIT ?
+        """,
+        params,
+    ).fetchall()
+
+    merged_incidents: list[dict] = []
+    merged_pairs: set[tuple[str, str]] = set()
+
+    for row in rows:
+        current_incident_id = str(row["incident_id"] or "").strip()
+        if not current_incident_id:
+            continue
+
+        preferred_incident_id = find_reconciliation_incident(
+            conn,
+            {
+                "id": row["id"],
+                "camera": row["camera"],
+                "label": row["label"],
+                "start_time": row["start_time"],
+            },
+            exclude_event_id=str(row["id"]),
+        )
+        if not preferred_incident_id or preferred_incident_id == current_incident_id:
+            continue
+
+        pair = tuple(sorted((current_incident_id, preferred_incident_id)))
+        if pair in merged_pairs:
+            continue
+
+        current_start = conn.execute(
+            "SELECT MIN(start_time) AS start_time FROM events WHERE incident_id = ?",
+            (current_incident_id,),
+        ).fetchone()["start_time"]
+        preferred_start = conn.execute(
+            "SELECT MIN(start_time) AS start_time FROM events WHERE incident_id = ?",
+            (preferred_incident_id,),
+        ).fetchone()["start_time"]
+
+        target_incident_id = preferred_incident_id
+        source_incident_id = current_incident_id
+        if (
+            current_start is not None
+            and preferred_start is not None
+            and float(current_start) < float(preferred_start)
+        ):
+            target_incident_id = current_incident_id
+            source_incident_id = preferred_incident_id
+
+        merged_pairs.add(tuple(sorted((source_incident_id, target_incident_id))))
+        merged_incidents.append(
+            {
+                "source_incident_id": source_incident_id,
+                "target_incident_id": target_incident_id,
+                "trigger_event_id": str(row["id"]),
+            }
+        )
+
+        if dry_run:
+            continue
+
+        merge_incidents(conn, target_incident_id, source_incident_id)
+
+    return {
+        "enabled": INCIDENT_RECONCILIATION_ENABLED,
+        "inspected_events": len(rows),
+        "merge_candidates": len(merged_incidents),
+        "merged_incidents": merged_incidents,
+    }
+
+
 def classify_incident_fallback(
     initial_severity: str,
     labels: list[str],
@@ -914,79 +1253,96 @@ def fetch_image_as_data_url(url: str, source_path: str | None = None) -> str | N
 
 
 def call_visual_validation(
-    anchor_event: dict, candidate_events: list[dict]
+    reference_events: list[dict], candidate_event: dict
 ) -> dict | None:
     if not LLM_BASE_URL or not VISUAL_VALIDATION_MODEL:
         return None
 
-    if not anchor_event.get("thumb_url"):
+    if not reference_events or not candidate_event.get("thumb_url"):
         return None
 
-    anchor_data_url = fetch_image_as_data_url(
-        anchor_event["thumb_url"], anchor_event.get("thumb_path")
-    )
-    if not anchor_data_url:
-        return None
-
-    prepared_candidates = []
-    for event in candidate_events[:VISUAL_VALIDATION_MAX_IMAGES]:
+    prepared_references = []
+    reference_limit = max(1, VISUAL_VALIDATION_MAX_IMAGES - 1)
+    for event in reference_events[-reference_limit:]:
         if not event.get("thumb_url"):
             continue
         data_url = fetch_image_as_data_url(event["thumb_url"], event.get("thumb_path"))
         if not data_url:
             continue
-        prepared_candidates.append(
+        topology_note = describe_camera_topology(
+            event.get("camera"), candidate_event.get("camera"), TOPOLOGY
+        )
+        prepared_references.append(
             {
                 "event_id": event["id"],
                 "camera": event.get("camera"),
                 "time": event.get("start_time"),
+                "topology_note": topology_note,
                 "image_data_url": data_url,
             }
         )
 
-    if not prepared_candidates:
+    if not prepared_references:
         return None
 
-    system_prompt = (
-        "You are validating whether surveillance event images belong to the same subject. "
-        "Use the anchor image as the reference subject. "
-        "For each candidate image, decide whether it likely shows the same subject as the anchor. "
-        "Be conservative. If uncertain due to angle, distance, or occlusion, prefer low confidence rather than a false match. "
-        "Return ONLY raw JSON with this format: "
-        '{"matches":[{"event_id":"...","match":true,"confidence":0.0}],"overall_confidence":0.0}'
+    candidate_data_url = fetch_image_as_data_url(
+        candidate_event["thumb_url"], candidate_event.get("thumb_path")
     )
+    if not candidate_data_url:
+        return None
+
+    system_prompt = VISUAL_SYSTEM_PROMPT or visual_validation_prompt_fallback()
 
     content = [
         {
             "type": "text",
             "text": (
-                "Anchor image first. Then candidate images. "
-                "Evaluate whether each candidate likely shows the same subject as the anchor. "
-                "Confidence must be 0.0 to 1.0."
+                "Reference images first, oldest to newest. Then the candidate image. "
+                "Evaluate whether the candidate likely shows the same subject continuing through the reference chain. "
+                "Confidence must be 0.0 to 1.0. Include a short reason. "
+                "For adjacent cameras, continuity over time matters more than small apparent color shifts. "
+                "A generic label and a more specific label may still describe the same subject, so do not treat label naming differences alone as a mismatch. "
+                "Reject only when the visual evidence or movement continuity shows a real mismatch."
             ),
-        },
-        {
-            "type": "text",
-            "text": f"Anchor event_id={anchor_event['id']} camera={anchor_event.get('camera')}",
-        },
-        {"type": "image_url", "image_url": {"url": anchor_data_url}},
+        }
     ]
 
-    for candidate in prepared_candidates:
+    for reference in prepared_references:
         content.append(
             {
                 "type": "text",
-                "text": f"Candidate event_id={candidate['event_id']} camera={candidate.get('camera')}",
+                "text": (
+                    f"Reference event_id={reference['event_id']} "
+                    f"camera={reference.get('camera')} "
+                    f"time={reference.get('time')} "
+                    f"topology_to_candidate={reference.get('topology_note')}"
+                ),
             }
         )
         content.append(
             {
                 "type": "image_url",
-                "image_url": {"url": candidate["image_data_url"]},
+                "image_url": {"url": reference["image_data_url"]},
             }
         )
 
-    try:
+    content.append(
+        {
+            "type": "text",
+            "text": (
+                f"Candidate event_id={candidate_event['id']} "
+                f"camera={candidate_event.get('camera')} "
+                f"time={candidate_event.get('start_time')}"
+            ),
+        }
+    )
+    content.append({"type": "image_url", "image_url": {"url": candidate_data_url}})
+
+    def post_visual_request(user_content: list[dict], extra_system_text: str = "") -> str:
+        system_text = system_prompt
+        if extra_system_text:
+            system_text = f"{system_prompt} {extra_system_text}"
+
         print(f"[VISUAL] calling {LLM_BASE_URL} model={VISUAL_VALIDATION_MODEL}")
         response = requests.post(
             f"{LLM_BASE_URL}/chat/completions",
@@ -998,8 +1354,8 @@ def call_visual_validation(
                 "model": VISUAL_VALIDATION_MODEL,
                 "temperature": 0.1,
                 "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": content},
+                    {"role": "system", "content": system_text},
+                    {"role": "user", "content": user_content},
                 ],
             },
             timeout=LLM_TIMEOUT,
@@ -1014,39 +1370,86 @@ def call_visual_validation(
                 for part in message_content
                 if isinstance(part, dict)
             )
+        return str(message_content or "")
 
-        parsed = extract_json_from_text(message_content)
-
-        matches = parsed.get("matches", []) or []
-        overall_confidence = parsed.get("overall_confidence")
+    try:
+        message_content = post_visual_request(content)
         try:
-            overall_confidence = (
-                float(overall_confidence) if overall_confidence is not None else None
-            )
+            parsed = extract_json_from_text(message_content)
         except Exception:
-            overall_confidence = None
-
-        normalized = []
-        for item in matches:
-            try:
-                confidence = float(item.get("confidence", 0))
-            except Exception:
-                confidence = 0.0
-            normalized.append(
-                {
-                    "event_id": item.get("event_id"),
-                    "match": bool(item.get("match")),
-                    "confidence": confidence,
-                }
+            preview = " ".join(message_content.strip().split())
+            print(
+                f"[VISUAL] parse failed for candidate {candidate_event.get('id')}: "
+                f"{preview[:500]}"
             )
+
+            retry_content = content + [
+                {
+                    "type": "text",
+                    "text": (
+                        "Your previous reply was not valid JSON. "
+                        "Retry now and return ONLY one raw JSON object with keys "
+                        "match, confidence, and reason. Do not include markdown."
+                    ),
+                }
+            ]
+            message_content = post_visual_request(
+                retry_content,
+                extra_system_text=(
+                    "Your response must be valid JSON only. "
+                    "Do not add prose, code fences, or commentary."
+                ),
+            )
+            parsed = extract_json_from_text(message_content)
+
+        try:
+            confidence = float(parsed.get("confidence", 0))
+        except Exception:
+            confidence = 0.0
 
         return {
-            "matches": normalized,
-            "overall_confidence": overall_confidence,
+            "match": bool(parsed.get("match")),
+            "confidence": confidence,
+            "reason": parsed.get("reason"),
         }
     except Exception as e:
-        print(f"[VISUAL] validation failed: {e}")
+        print(
+            f"[VISUAL] validation failed for candidate {candidate_event.get('id')}: {e}"
+        )
         return None
+
+
+def clean_visual_exclusion_reason(reason: object) -> str | None:
+    if reason is None:
+        return None
+
+    text = " ".join(str(reason).strip().split())
+    if not text:
+        return None
+    return text[:160]
+
+
+def build_visual_exclusion_reason(
+    result_item: dict | None, confidence: float
+) -> str | None:
+    reason = clean_visual_exclusion_reason(
+        result_item.get("reason") if result_item else None
+    )
+    if reason:
+        return reason
+
+    if result_item and result_item.get("match") and confidence < VISUAL_VALIDATION_THRESHOLD:
+        confidence_pct = int(round(confidence * 100))
+        threshold_pct = int(round(VISUAL_VALIDATION_THRESHOLD * 100))
+        return (
+            f"Matched the anchor at {confidence_pct}% confidence, below the "
+            f"{threshold_pct}% threshold."
+        )
+
+    if result_item:
+        return "Did not appear to show the same subject as the anchor event."
+
+    return "Validation did not return a match result for this event."
 
 
 def call_incident_llm(
@@ -1232,7 +1635,7 @@ def refresh_incident_record(conn: sqlite3.Connection, incident_id: str) -> None:
                label, score, severity, thumb_path,
                metadata_title, metadata_summary, metadata_scene,
                metadata_confidence, metadata_threat_level,
-               visual_match, visual_confidence, manual_order,
+               visual_match, visual_confidence, visual_exclusion_reason, visual_manual_override, manual_order,
                zones_json, objects_json, updated_at
         FROM events
         WHERE incident_id = ?
@@ -1554,6 +1957,53 @@ def refresh_waiting_incidents_to_pending() -> None:
         conn.close()
 
 
+def prune_small_incidents_once(conn: sqlite3.Connection) -> dict[str, int]:
+    if INCIDENT_MIN_EVENTS <= 1:
+        return {"deleted_incidents": 0, "deleted_events": 0}
+
+    now = datetime.utcnow()
+    incident_rows = conn.execute(
+        """
+        SELECT incident_id, event_count, updated_at, source_updated_at, manual_editing
+        FROM incidents
+        WHERE event_count < ?
+        """,
+        (INCIDENT_MIN_EVENTS,),
+    ).fetchall()
+
+    deleted_incidents = 0
+    deleted_events = 0
+
+    for row in incident_rows:
+        if bool(row["manual_editing"]):
+            continue
+
+        reference_dt = parse_iso_timestamp(row["source_updated_at"]) or parse_iso_timestamp(
+            row["updated_at"]
+        )
+        if not reference_dt:
+            continue
+
+        idle_seconds = (now - reference_dt).total_seconds()
+        if idle_seconds < INCIDENT_MIN_EVENTS_PRUNE_SECONDS:
+            continue
+
+        incident_id = row["incident_id"]
+        event_total = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE incident_id = ?",
+            (incident_id,),
+        ).fetchone()[0]
+        conn.execute("DELETE FROM events WHERE incident_id = ?", (incident_id,))
+        conn.execute("DELETE FROM incidents WHERE incident_id = ?", (incident_id,))
+        deleted_incidents += 1
+        deleted_events += int(event_total or 0)
+
+    return {
+        "deleted_incidents": deleted_incidents,
+        "deleted_events": deleted_events,
+    }
+
+
 def reorder_event_in_incident(event_id: str, direction: int) -> dict | None:
     conn = get_db_connection()
     try:
@@ -1592,11 +2042,13 @@ def reorder_event_in_incident(event_id: str, direction: int) -> dict | None:
 
         target_index = current_index + int(direction)
         if target_index < 0 or target_index >= len(event_ids):
+            touched_ids = _set_incident_manual_editing(conn, [str(incident_id)], True)
+            conn.commit()
             return {
                 "event_id": str(event_id),
                 "incident_id": str(incident_id),
                 "manual_order_changed": False,
-                "editing_incident_ids": [str(incident_id)],
+                "editing_incident_ids": touched_ids,
             }
 
         moved_id = event_ids.pop(current_index)
@@ -1627,8 +2079,55 @@ def reorder_event_in_incident(event_id: str, direction: int) -> dict | None:
         conn.close()
 
 
+def remove_event_from_incident(event_id: str) -> dict | None:
+    conn = get_db_connection()
+    try:
+        row = conn.execute(
+            """
+            SELECT id, incident_id
+            FROM events
+            WHERE id = ?
+            """,
+            (event_id,),
+        ).fetchone()
+
+        if not row:
+            return None
+
+        incident_id = row["incident_id"]
+        if not incident_id:
+            raise ValueError("event_incident_missing")
+
+        touched_ids = _set_incident_manual_editing(conn, [str(incident_id)], True)
+        conn.execute("DELETE FROM events WHERE id = ?", (event_id,))
+        refresh_incident_record(conn, str(incident_id))
+        conn.commit()
+
+        remaining = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM events
+            WHERE incident_id = ?
+            """,
+            (incident_id,),
+        ).fetchone()["count"]
+
+        return {
+            "event_id": str(event_id),
+            "incident_id": str(incident_id),
+            "editing_incident_ids": touched_ids,
+            "incident_deleted": remaining == 0,
+            "remaining_event_count": int(remaining or 0),
+        }
+    finally:
+        conn.close()
+
+
 def _set_incident_manual_editing(
-    conn: sqlite3.Connection, incident_ids: list[str], editing: bool
+    conn: sqlite3.Connection,
+    incident_ids: list[str],
+    editing: bool,
+    reprocess: bool = True,
 ) -> list[str]:
     normalized_ids = []
     for incident_id in incident_ids:
@@ -1652,7 +2151,7 @@ def _set_incident_manual_editing(
             (incident_id, 1 if editing else 0, timestamp, timestamp),
         )
 
-        if editing:
+        if editing or not reprocess:
             continue
 
         conn.execute(
@@ -1690,10 +2189,14 @@ def _set_incident_manual_editing(
     return normalized_ids
 
 
-def set_incident_manual_editing(incident_ids: list[str], editing: bool) -> list[str]:
+def set_incident_manual_editing(
+    incident_ids: list[str], editing: bool, reprocess: bool = True
+) -> list[str]:
     conn = get_db_connection()
     try:
-        result = _set_incident_manual_editing(conn, incident_ids, editing)
+        result = _set_incident_manual_editing(
+            conn, incident_ids, editing, reprocess=reprocess
+        )
         conn.commit()
         return result
     finally:
@@ -1758,6 +2261,51 @@ def retry_incident_llm(incident_id: str) -> dict | None:
         conn.close()
 
 
+def override_visual_exclusion(event_id: str) -> dict | None:
+    conn = get_db_connection()
+    try:
+        row = conn.execute(
+            """
+            SELECT id, incident_id
+            FROM events
+            WHERE id = ?
+            """,
+            (event_id,),
+        ).fetchone()
+
+        if not row:
+            return None
+
+        incident_id = row["incident_id"]
+        if not incident_id:
+            raise ValueError("event_incident_missing")
+
+        touched_ids = _set_incident_manual_editing(conn, [str(incident_id)], True)
+
+        conn.execute(
+            """
+            UPDATE events
+            SET visual_manual_override = 1,
+                visual_match = 1,
+                visual_exclusion_reason = NULL
+            WHERE id = ?
+            """,
+            (event_id,),
+        )
+
+        refresh_incident_record(conn, incident_id)
+        conn.commit()
+
+        return {
+            "event_id": str(event_id),
+            "incident_id": str(incident_id),
+            "visual_manual_override": True,
+            "editing_incident_ids": touched_ids,
+        }
+    finally:
+        conn.close()
+
+
 def process_pending_visual_validation_once() -> None:
     if not VISUAL_VALIDATION_ENABLED or not LLM_BASE_URL or not VISUAL_VALIDATION_MODEL:
         return
@@ -1781,13 +2329,14 @@ def process_pending_visual_validation_once() -> None:
             try:
                 rows = conn.execute(
                     """
-                    SELECT id, camera, start_time, thumb_path, updated_at, visual_match, visual_confidence, manual_order
+                    SELECT id, camera, label, start_time, thumb_path, updated_at, visual_match, visual_confidence, manual_order
+                           , visual_manual_override
                     FROM events
                     WHERE incident_id = ?
                     """,
                     (incident_id,),
                 ).fetchall()
-                rows = sorted(rows, key=event_sort_key)
+                rows = sorted(rows, key=display_event_sort_key)
 
                 if not rows:
                     conn.execute(
@@ -1832,8 +2381,11 @@ def process_pending_visual_validation_once() -> None:
                             "id": row["id"],
                             "camera": row["camera"],
                             "start_time": row["start_time"],
+                            "label": row["label"],
                             "thumb_path": row["thumb_path"],
                             "thumb_url": thumb_url,
+                            "visual_manual_override": bool(row["visual_manual_override"]),
+                            "visual_confidence": row["visual_confidence"],
                         }
                     )
 
@@ -1856,94 +2408,140 @@ def process_pending_visual_validation_once() -> None:
                     continue
 
                 anchor_event = events_payload[0]
-                candidate_events = [
-                    e for e in events_payload if e["id"] != anchor_event["id"]
-                ]
-
-                result = call_visual_validation(anchor_event, candidate_events)
-
-                if not result:
-                    conn.execute(
-                        """
-                        UPDATE incidents
-                        SET visual_status = 'error',
-                            visual_error = 'Visual validation failed',
-                            visual_updated_at = ?,
-                            updated_at = ?
-                        WHERE incident_id = ?
-                        """,
-                        (utc_now_iso(), utc_now_iso(), incident_id),
-                    )
-                    conn.commit()
-                    refresh_incident_record(conn, incident_id)
-                    conn.commit()
-                    continue
-
                 conn.execute(
                     """
                     UPDATE events
                     SET visual_match = 1,
-                        visual_confidence = 1.0
+                        visual_confidence = 1.0,
+                        visual_exclusion_reason = NULL
                     WHERE id = ?
                     """,
                     (anchor_event["id"],),
                 )
 
-                match_map = {
-                    item["event_id"]: item for item in result.get("matches", [])
-                }
+                accepted_chain = [anchor_event]
+                chain_confidences = []
+                anchor_label = normalize_label(anchor_event.get("label"))
 
-                for event in candidate_events:
-                    item = match_map.get(event["id"])
-                    if not item:
-                        match = 0
-                        confidence = 0.0
-                    else:
-                        confidence = float(item.get("confidence", 0.0))
-                        match = (
-                            1
-                            if (
-                                item.get("match")
-                                and confidence >= VISUAL_VALIDATION_THRESHOLD
-                            )
-                            else 0
+                for event in events_payload[1:]:
+                    candidate_label = normalize_label(event.get("label"))
+
+                    if event.get("visual_manual_override"):
+                        conn.execute(
+                            """
+                            UPDATE events
+                            SET visual_match = 1,
+                                visual_exclusion_reason = NULL
+                            WHERE id = ?
+                            """,
+                            (event["id"],),
                         )
+                        accepted_chain.append(event)
+                        continue
+
+                    eligible_references = [
+                        chain_event
+                        for chain_event in accepted_chain
+                        if label_can_anchor_reference(
+                            anchor_label,
+                            chain_event.get("label"),
+                            candidate_label,
+                        )
+                    ]
+                    if not eligible_references:
+                        eligible_references = [accepted_chain[-1]]
+
+                    if len(eligible_references) > 1:
+                        reference_events = [
+                            eligible_references[-2],
+                            eligible_references[-1],
+                        ]
+                    else:
+                        reference_events = [eligible_references[-1]]
+                    result = call_visual_validation(reference_events, event)
+
+                    if not result:
+                        conn.execute(
+                            """
+                            UPDATE incidents
+                            SET visual_status = 'error',
+                                visual_error = 'Visual validation failed',
+                                visual_updated_at = ?,
+                                updated_at = ?
+                            WHERE incident_id = ?
+                            """,
+                            (utc_now_iso(), utc_now_iso(), incident_id),
+                        )
+                        conn.commit()
+                        refresh_incident_record(conn, incident_id)
+                        conn.commit()
+                        break
+
+                    confidence = float(result.get("confidence", 0.0))
+                    chain_confidences.append(confidence)
+                    effective_threshold = visual_validation_threshold_for(
+                        reference_events, event
+                    )
+                    match = (
+                        1
+                        if (
+                            result.get("match")
+                            and confidence >= effective_threshold
+                        )
+                        else 0
+                    )
+                    exclusion_reason = (
+                        build_visual_exclusion_reason(result, confidence)
+                        if match == 0
+                        else None
+                    )
 
                     conn.execute(
                         """
                         UPDATE events
                         SET visual_match = ?,
-                            visual_confidence = ?
+                            visual_confidence = ?,
+                            visual_exclusion_reason = ?
                         WHERE id = ?
                         """,
                         (
                             match,
                             confidence,
+                            exclusion_reason,
                             event["id"],
                         ),
                     )
+                    if match == 1:
+                        accepted_chain.append(event)
 
-                conn.execute(
-                    """
-                    UPDATE incidents
-                    SET visual_status = 'ready',
-                        visual_error = NULL,
-                        visual_updated_at = ?,
-                        visual_confidence = ?,
-                        updated_at = ?
-                    WHERE incident_id = ?
-                    """,
-                    (
-                        utc_now_iso(),
-                        result.get("overall_confidence"),
-                        utc_now_iso(),
-                        incident_id,
-                    ),
-                )
-                conn.commit()
+                else:
+                    overall_confidence = (
+                        sum(chain_confidences) / len(chain_confidences)
+                        if chain_confidences
+                        else 1.0
+                    )
 
-                refresh_incident_record(conn, incident_id)
-                conn.commit()
+                    conn.execute(
+                        """
+                        UPDATE incidents
+                        SET visual_status = 'ready',
+                            visual_error = NULL,
+                            visual_updated_at = ?,
+                            visual_confidence = ?,
+                            updated_at = ?
+                        WHERE incident_id = ?
+                        """,
+                        (
+                            utc_now_iso(),
+                            overall_confidence,
+                            utc_now_iso(),
+                            incident_id,
+                        ),
+                    )
+                    conn.commit()
+
+                    refresh_incident_record(conn, incident_id)
+                    conn.commit()
 
             except Exception as e:
                 conn.execute(
@@ -1998,7 +2596,7 @@ def process_pending_incident_videos_once() -> None:
                     """,
                     (incident_id,),
                 ).fetchall()
-                event_rows = sorted(event_rows, key=event_sort_key)
+                event_rows = sorted(event_rows, key=display_event_sort_key)
 
                 if not event_rows or not video_generation_should_run(event_rows):
                     conn.execute(
@@ -2289,6 +2887,13 @@ def incident_worker_loop() -> None:
     print("[WORKER] incident worker started")
     while True:
         try:
+            conn = get_db_connection()
+            try:
+                reconcile_incidents_once(conn)
+                prune_small_incidents_once(conn)
+                conn.commit()
+            finally:
+                conn.close()
             refresh_waiting_incidents_to_pending()
             process_pending_visual_validation_once()
             process_pending_incident_videos_once()
@@ -2376,12 +2981,19 @@ def api_events():
                label, score, severity, thumb_path,
                metadata_title, metadata_summary, metadata_scene,
                metadata_confidence, metadata_threat_level,
-               visual_match, visual_confidence,
+               visual_match, visual_confidence, visual_exclusion_reason, visual_manual_override,
                zones_json, objects_json, updated_at
         FROM events
+        WHERE incident_id IN (
+            SELECT incident_id
+            FROM incidents
+            WHERE event_count >= ?
+        )
         ORDER BY updated_at DESC
         LIMIT 100
         """
+        ,
+        (INCIDENT_MIN_EVENTS,),
     ).fetchall()
     conn.close()
 
@@ -2410,6 +3022,8 @@ def api_events():
                 "threat_level": r["metadata_threat_level"],
                 "visual_match": r["visual_match"],
                 "visual_confidence": r["visual_confidence"],
+                "visual_exclusion_reason": r["visual_exclusion_reason"],
+                "visual_manual_override": bool(r["visual_manual_override"]),
                 "zones": json.loads(r["zones_json"] or "[]"),
                 "objects": json.loads(r["objects_json"] or "[]"),
                 "updated_at": r["updated_at"],
@@ -2425,9 +3039,12 @@ def api_incidents():
         """
         SELECT *
         FROM incidents
+        WHERE event_count >= ?
         ORDER BY updated_at DESC
         LIMIT 50
         """
+        ,
+        (INCIDENT_MIN_EVENTS,),
     ).fetchall()
 
     results = []
@@ -2438,7 +3055,7 @@ def api_incidents():
                    label, score, severity, thumb_path,
                    metadata_title, metadata_summary, metadata_scene,
                    metadata_confidence, metadata_threat_level,
-                   visual_match, visual_confidence, manual_order,
+                   visual_match, visual_confidence, visual_exclusion_reason, visual_manual_override, manual_order,
                    zones_json, objects_json, updated_at
             FROM events
             WHERE incident_id = ?
@@ -2474,19 +3091,17 @@ def api_incidents():
                 "threat_level": row["metadata_threat_level"],
                 "visual_match": row["visual_match"],
                 "visual_confidence": row["visual_confidence"],
+                "visual_exclusion_reason": row["visual_exclusion_reason"],
+                "visual_manual_override": bool(row["visual_manual_override"]),
                 "zones": json.loads(row["zones_json"] or "[]"),
                 "objects": json.loads(row["objects_json"] or "[]"),
                 "updated_at": row["updated_at"],
             }
             all_events_payload.append(item)
-
-            if incident["visual_status"] == "ready" and row["visual_match"] == 0:
-                continue
-
             visible_events_payload.append(item)
 
         visible_cameras = []
-        for ev in visible_events_payload:
+        for ev in all_events_payload:
             if ev["camera"] not in visible_cameras:
                 visible_cameras.append(ev["camera"])
 
@@ -2497,11 +3112,13 @@ def api_incidents():
                 "label": ev["label"],
                 "event_type": ev["event_type"],
             }
-            for ev in visible_events_payload
+            for ev in all_events_payload
         ]
 
-        excluded_event_count = max(
-            0, len(all_events_payload) - len(visible_events_payload)
+        excluded_event_count = sum(
+            1
+            for ev in all_events_payload
+            if incident["visual_status"] == "ready" and ev["visual_match"] == 0
         )
 
         results.append(
@@ -2566,17 +3183,27 @@ def api_topology_reload():
 @app.route("/api/prompt/reload", methods=["GET", "POST"])
 def api_prompt_reload():
     refresh_system_prompt()
+    refresh_visual_system_prompt()
     return jsonify(
         {
             "status": "reloaded",
             "prompt_path": PROMPT_PATH,
             "length": len(SYSTEM_PROMPT),
+            "visual_prompt_path": VISUAL_PROMPT_PATH,
+            "visual_length": len(VISUAL_SYSTEM_PROMPT),
         }
     )
 
 
 @app.route("/api/worker/run", methods=["GET", "POST"])
 def api_worker_run():
+    conn = get_db_connection()
+    try:
+        reconcile_incidents_once(conn)
+        prune_small_incidents_once(conn)
+        conn.commit()
+    finally:
+        conn.close()
     refresh_waiting_incidents_to_pending()
     process_pending_visual_validation_once()
     process_pending_incident_videos_once()
@@ -2632,6 +3259,61 @@ def api_rebuild_incident(incident_id):
         conn.close()
 
 
+@app.route("/api/incidents/reconcile", methods=["GET", "POST"])
+def api_reconcile_incidents():
+    payload = request.get_json(silent=True) or {}
+
+    def parse_float(value):
+        if value in (None, ""):
+            return None
+        return float(value)
+
+    try:
+        start_time = parse_float(
+            payload.get("start_time", request.args.get("start_time"))
+        )
+        end_time = parse_float(payload.get("end_time", request.args.get("end_time")))
+        max_events = payload.get("max_events", request.args.get("max_events"))
+        max_events = int(max_events) if max_events not in (None, "") else None
+        dry_run_value = payload.get("dry_run", request.args.get("dry_run"))
+        dry_run = (
+            str(dry_run_value).lower() in {"1", "true", "yes", "on"}
+            if dry_run_value is not None
+            else False
+        )
+    except (TypeError, ValueError):
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "message": "start_time/end_time must be numeric and max_events must be an integer",
+                }
+            ),
+            400,
+        )
+
+    conn = get_db_connection()
+    try:
+        result = reconcile_incidents_once(
+            conn,
+            start_time=start_time,
+            end_time=end_time,
+            max_events=max_events,
+            dry_run=dry_run,
+        )
+        if not dry_run:
+            conn.commit()
+        return jsonify(
+            {
+                "status": "ok",
+                "dry_run": dry_run,
+                **result,
+            }
+        )
+    finally:
+        conn.close()
+
+
 @app.route("/api/incidents/<incident_id>/retry-ai", methods=["POST"])
 def api_retry_incident_ai(incident_id):
     try:
@@ -2643,6 +3325,32 @@ def api_retry_incident_ai(incident_id):
         return jsonify({"status": "missing", "incident_id": incident_id}), 404
 
     return jsonify({"status": "queued", **result})
+
+
+@app.route("/api/events/<event_id>/override-visual", methods=["POST"])
+def api_override_visual_event(event_id):
+    try:
+        result = override_visual_exclusion(event_id)
+    except ValueError as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 400
+
+    if not result:
+        return jsonify({"status": "missing", "event_id": event_id}), 404
+
+    return jsonify({"status": "updated", **result})
+
+
+@app.route("/api/events/<event_id>/remove", methods=["POST"])
+def api_remove_event(event_id):
+    try:
+        result = remove_event_from_incident(event_id)
+    except ValueError as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 400
+
+    if not result:
+        return jsonify({"status": "missing", "event_id": event_id}), 404
+
+    return jsonify({"status": "removed", **result})
 
 
 @app.route("/api/events/<event_id>/shift", methods=["POST"])
@@ -2673,12 +3381,22 @@ def api_set_incidents_editing():
     payload = request.get_json(silent=True) or {}
     incident_ids = payload.get("incident_ids") or []
     editing = bool(payload.get("editing"))
+    reprocess = bool(payload.get("reprocess", True))
 
     if not isinstance(incident_ids, list):
         return jsonify({"status": "error", "message": "incident_ids must be a list"}), 400
 
-    updated_ids = set_incident_manual_editing(incident_ids, editing)
-    return jsonify({"status": "ok", "incident_ids": updated_ids, "editing": editing})
+    updated_ids = set_incident_manual_editing(
+        incident_ids, editing, reprocess=reprocess
+    )
+    return jsonify(
+        {
+            "status": "ok",
+            "incident_ids": updated_ids,
+            "editing": editing,
+            "reprocess": reprocess,
+        }
+    )
 
 
 @app.route("/video/<incident_id>")
@@ -2705,10 +3423,13 @@ def health():
             "frigate_vod_base": FRIGATE_VOD_BASE,
             "incident_window_seconds": INCIDENT_WINDOW_SECONDS,
             "incident_llm_idle_seconds": INCIDENT_LLM_IDLE_SECONDS,
+            "incident_min_events": INCIDENT_MIN_EVENTS,
+            "incident_min_events_prune_seconds": INCIDENT_MIN_EVENTS_PRUNE_SECONDS,
             "llm_enabled": bool(LLM_BASE_URL and LLM_MODEL),
             "llm_base_url": LLM_BASE_URL,
             "llm_model": LLM_MODEL,
             "prompt_path": PROMPT_PATH,
+            "visual_prompt_path": VISUAL_PROMPT_PATH,
             "topology_path": TOPOLOGY_PATH,
             "topology_loaded": bool(
                 TOPOLOGY.get("adjacency") or TOPOLOGY.get("hard_boundaries")
