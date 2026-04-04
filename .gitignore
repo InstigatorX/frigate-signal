@@ -1,5 +1,5 @@
 *.mp4
-venv/*
+venv/
 *.db
 .env
 .codex
@@ -8,3 +8,6 @@ __pycache__/
 *.pyo
 *.pyd
 build/
+incident_videos/
+.venv/
+

@@ -5,18 +5,29 @@ import uuid
 import threading
 import time
 import base64
+import logging
 from pathlib import Path
 from collections import deque
-from datetime import datetime
+from datetime import UTC, datetime
 from flask import Flask, render_template, jsonify, send_file, request
 import paho.mqtt.client as mqtt
 import requests
 import subprocess
 import tempfile
 import shutil
+import contextlib
+from io import BytesIO
+from functools import lru_cache
+from PIL import Image
 
 DB_PATH = os.getenv("DB_PATH", "events.db")
 APP_PORT = int(os.getenv("APP_PORT", "5001"))
+HTTP_ACCESS_LOGS = os.getenv("HTTP_ACCESS_LOGS", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 MQTT_BROKER = os.getenv("MQTT_BROKER", "192.168.86.252")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
@@ -34,6 +45,9 @@ FRIGATE_VOD_BASE = os.getenv("FRIGATE_VOD_BASE", FRIGATE_PUBLIC_BASE + "/api")
 INCIDENT_WINDOW_SECONDS = int(os.getenv("INCIDENT_WINDOW_SECONDS", "30"))
 INCIDENT_LLM_IDLE_SECONDS = int(os.getenv("INCIDENT_LLM_IDLE_SECONDS", "15"))
 INCIDENT_MIN_EVENTS = max(1, int(os.getenv("INCIDENT_MIN_EVENTS", "3")))
+INCIDENT_PROCESS_BELOW_MIN_EVENTS = os.getenv(
+    "INCIDENT_PROCESS_BELOW_MIN_EVENTS", "true"
+).lower() in ("1", "true", "yes", "on")
 INCIDENT_MIN_EVENTS_PRUNE_SECONDS = max(
     INCIDENT_WINDOW_SECONDS,
     int(os.getenv("INCIDENT_MIN_EVENTS_PRUNE_SECONDS", str(INCIDENT_WINDOW_SECONDS))),
@@ -43,6 +57,8 @@ LLM_BASE_URL = os.getenv("LLM_BASE_URL", "").rstrip("/")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "dummy")
 LLM_MODEL = os.getenv("LLM_MODEL", "")
 LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "20"))
+INCIDENT_LLM_TIMEOUT = int(os.getenv("INCIDENT_LLM_TIMEOUT", str(LLM_TIMEOUT)))
+INCIDENT_LLM_MAX_RETRIES = max(1, int(os.getenv("INCIDENT_LLM_MAX_RETRIES", "2")))
 
 TOPOLOGY_PATH = os.getenv("TOPOLOGY_PATH", "camera_topology.json")
 TOPOLOGY_MAX_HOPS = int(os.getenv("TOPOLOGY_MAX_HOPS", "2"))
@@ -75,6 +91,20 @@ VISUAL_VALIDATION_ENABLED = os.getenv("VISUAL_VALIDATION_ENABLED", "true").lower
     "yes",
     "on",
 )
+VISUAL_MATCHER_MODE = os.getenv("VISUAL_MATCHER_MODE", "llm").strip().lower() or "llm"
+VISUAL_LOCAL_MATCHER = (
+    os.getenv("VISUAL_LOCAL_MATCHER", "hash").strip().lower() or "hash"
+)
+VISUAL_DETECTOR_MODE = (
+    os.getenv("VISUAL_DETECTOR_MODE", "none").strip().lower() or "none"
+)
+VISUAL_DETECTOR_MODEL = os.getenv("VISUAL_DETECTOR_MODEL", "yolo11n.pt").strip()
+VISUAL_DETECTOR_CONFIDENCE = float(
+    os.getenv("VISUAL_DETECTOR_CONFIDENCE", "0.25")
+)
+VISUAL_EMBEDDING_MODEL = os.getenv(
+    "VISUAL_EMBEDDING_MODEL", "openai/clip-vit-base-patch32"
+).strip()
 VISUAL_VALIDATION_MODEL = os.getenv("VISUAL_VALIDATION_MODEL", LLM_MODEL)
 VISUAL_VALIDATION_MIN_EVENTS = int(os.getenv("VISUAL_VALIDATION_MIN_EVENTS", "3"))
 VISUAL_VALIDATION_MAX_IMAGES = int(os.getenv("VISUAL_VALIDATION_MAX_IMAGES", "6"))
@@ -82,6 +112,22 @@ VISUAL_VALIDATION_THRESHOLD = float(os.getenv("VISUAL_VALIDATION_THRESHOLD", "0.
 VISUAL_VALIDATION_ADJACENT_THRESHOLD = float(
     os.getenv("VISUAL_VALIDATION_ADJACENT_THRESHOLD", "0.35")
 )
+VISUAL_LOCAL_MATCH_THRESHOLD = float(
+    os.getenv("VISUAL_LOCAL_MATCH_THRESHOLD", "0.78")
+)
+VISUAL_LOCAL_REJECT_THRESHOLD = float(
+    os.getenv("VISUAL_LOCAL_REJECT_THRESHOLD", "0.38")
+)
+VISUAL_HASH_SIZE = max(4, int(os.getenv("VISUAL_HASH_SIZE", "8")))
+SUPPRESS_ML_BACKEND_WARNINGS = os.getenv(
+    "SUPPRESS_ML_BACKEND_WARNINGS", "true"
+).lower() in ("1", "true", "yes", "on")
+if VISUAL_MATCHER_MODE not in {"llm", "hash", "hybrid"}:
+    VISUAL_MATCHER_MODE = "llm"
+if VISUAL_LOCAL_MATCHER not in {"hash", "embedding"}:
+    VISUAL_LOCAL_MATCHER = "hash"
+if VISUAL_DETECTOR_MODE not in {"none", "yolo"}:
+    VISUAL_DETECTOR_MODE = "none"
 INCIDENT_RECONCILIATION_ENABLED = os.getenv(
     "INCIDENT_RECONCILIATION_ENABLED", "true"
 ).lower() in ("1", "true", "yes", "on")
@@ -121,15 +167,27 @@ _worker_started = False
 _worker_lock = threading.Lock()
 
 
+def configure_logging() -> None:
+    werkzeug_level = logging.INFO if HTTP_ACCESS_LOGS else logging.WARNING
+    logging.getLogger("werkzeug").setLevel(werkzeug_level)
+
+
+def utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
 def utc_now_iso() -> str:
-    return datetime.utcnow().isoformat()
+    return utc_now().isoformat()
 
 
 def parse_iso_timestamp(value: str | None) -> datetime | None:
     if not value:
         return None
     try:
-        return datetime.fromisoformat(value)
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
     except Exception:
         return None
 
@@ -467,6 +525,7 @@ def init_db() -> None:
             visual_confidence REAL,
             visual_exclusion_reason TEXT,
             visual_manual_override INTEGER,
+            visual_method TEXT,
             manual_order REAL,
             raw_json TEXT,
             updated_at TEXT
@@ -484,6 +543,7 @@ def init_db() -> None:
         "visual_confidence": "ALTER TABLE events ADD COLUMN visual_confidence REAL",
         "visual_exclusion_reason": "ALTER TABLE events ADD COLUMN visual_exclusion_reason TEXT",
         "visual_manual_override": "ALTER TABLE events ADD COLUMN visual_manual_override INTEGER",
+        "visual_method": "ALTER TABLE events ADD COLUMN visual_method TEXT",
         "manual_order": "ALTER TABLE events ADD COLUMN manual_order REAL",
     }
 
@@ -518,6 +578,7 @@ def init_db() -> None:
             visual_error TEXT,
             visual_updated_at TEXT,
             visual_confidence REAL,
+            visual_method TEXT,
             video_status TEXT,
             video_error TEXT,
             video_updated_at TEXT,
@@ -542,6 +603,7 @@ def init_db() -> None:
         "visual_error": "ALTER TABLE incidents ADD COLUMN visual_error TEXT",
         "visual_updated_at": "ALTER TABLE incidents ADD COLUMN visual_updated_at TEXT",
         "visual_confidence": "ALTER TABLE incidents ADD COLUMN visual_confidence REAL",
+        "visual_method": "ALTER TABLE incidents ADD COLUMN visual_method TEXT",
         "video_status": "ALTER TABLE incidents ADD COLUMN video_status TEXT",
         "video_error": "ALTER TABLE incidents ADD COLUMN video_error TEXT",
         "video_updated_at": "ALTER TABLE incidents ADD COLUMN video_updated_at TEXT",
@@ -1252,6 +1314,396 @@ def fetch_image_as_data_url(url: str, source_path: str | None = None) -> str | N
         return None
 
 
+def fetch_image_bytes(url: str) -> bytes | None:
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        return resp.content
+    except Exception as e:
+        print(f"[VISUAL] failed to fetch raw image {url}: {e}")
+        return None
+
+
+def open_image_bytes(image_bytes: bytes) -> Image.Image:
+    with Image.open(BytesIO(image_bytes)) as image:
+        return image.convert("RGB")
+
+
+@contextlib.contextmanager
+def suppress_native_stderr(enabled: bool):
+    if not enabled:
+        yield
+        return
+
+    stderr_fd = None
+    saved_stderr_fd = None
+    try:
+        stderr_fd = os.open(os.devnull, os.O_WRONLY)
+        saved_stderr_fd = os.dup(2)
+        os.dup2(stderr_fd, 2)
+        yield
+    finally:
+        if saved_stderr_fd is not None:
+            os.dup2(saved_stderr_fd, 2)
+            os.close(saved_stderr_fd)
+        if stderr_fd is not None:
+            os.close(stderr_fd)
+
+
+@lru_cache(maxsize=1)
+def get_embedding_runtime():
+    # Torch/native backends can emit one-time CPU capability warnings that add log noise.
+    with suppress_native_stderr(SUPPRESS_ML_BACKEND_WARNINGS):
+        import torch
+        from transformers import AutoProcessor, AutoModel
+
+        processor = AutoProcessor.from_pretrained(VISUAL_EMBEDDING_MODEL)
+        model = AutoModel.from_pretrained(VISUAL_EMBEDDING_MODEL)
+    model.eval()
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device)
+    return {
+        "torch": torch,
+        "processor": processor,
+        "model": model,
+        "device": device,
+    }
+
+
+@lru_cache(maxsize=1)
+def get_yolo_runtime():
+    with suppress_native_stderr(SUPPRESS_ML_BACKEND_WARNINGS):
+        from ultralytics import YOLO
+
+    return YOLO(VISUAL_DETECTOR_MODEL)
+
+
+def preferred_detection_labels(label: str | None) -> set[str]:
+    normalized = normalize_label(label)
+    label_map = {
+        "person": {"person"},
+        "car": {"car"},
+        "truck": {"truck"},
+        "bus": {"bus"},
+        "motorcycle": {"motorcycle"},
+        "bicycle": {"bicycle"},
+        "dog": {"dog"},
+        "cat": {"cat"},
+    }
+    preferred = label_map.get(normalized, set())
+    return preferred or {normalized}
+
+
+def crop_image_with_yolo(image: Image.Image, label: str | None) -> Image.Image:
+    if VISUAL_DETECTOR_MODE != "yolo":
+        return image
+
+    try:
+        model = get_yolo_runtime()
+        results = model.predict(image, conf=VISUAL_DETECTOR_CONFIDENCE, verbose=False)
+    except Exception as e:
+        print(f"[VISUAL] yolo detection failed: {e}")
+        return image
+
+    if not results:
+        return image
+
+    result = results[0]
+    boxes = getattr(result, "boxes", None)
+    names = getattr(result, "names", {}) or {}
+    xyxy = getattr(boxes, "xyxy", None) if boxes is not None else None
+    if xyxy is None:
+        return image
+
+    preferred = preferred_detection_labels(label)
+    selected_box = None
+    selected_score = -1.0
+
+    xyxy_list = xyxy.tolist() if hasattr(xyxy, "tolist") else []
+    conf_list = boxes.conf.tolist() if getattr(boxes, "conf", None) is not None and hasattr(boxes.conf, "tolist") else []
+    cls_list = boxes.cls.tolist() if getattr(boxes, "cls", None) is not None and hasattr(boxes.cls, "tolist") else []
+
+    for idx, coords in enumerate(xyxy_list):
+        confidence = float(conf_list[idx]) if idx < len(conf_list) else 0.0
+        cls_idx = int(cls_list[idx]) if idx < len(cls_list) else -1
+        detected_name = str(names.get(cls_idx, "")).strip().lower()
+        score = confidence
+        if detected_name in preferred:
+            score += 1.0
+        if score > selected_score:
+            selected_score = score
+            selected_box = coords
+
+    if not selected_box:
+        return image
+
+    x1, y1, x2, y2 = [int(round(value)) for value in selected_box[:4]]
+    width, height = image.size
+    x1 = max(0, min(x1, width))
+    y1 = max(0, min(y1, height))
+    x2 = max(x1 + 1, min(x2, width))
+    y2 = max(y1 + 1, min(y2, height))
+    return image.crop((x1, y1, x2, y2))
+
+
+def prepare_local_match_image(event: dict) -> Image.Image | None:
+    thumb_url = event.get("thumb_url")
+    if not thumb_url:
+        return None
+
+    image_bytes = fetch_image_bytes(thumb_url)
+    if not image_bytes:
+        return None
+
+    try:
+        image = open_image_bytes(image_bytes)
+    except Exception as e:
+        print(f"[VISUAL] failed to decode image {event.get('id')}: {e}")
+        return None
+
+    return crop_image_with_yolo(image, event.get("label"))
+
+
+def image_average_hash(
+    image: Image.Image, hash_size: int = VISUAL_HASH_SIZE
+) -> list[int]:
+    grayscale = image.convert("L").resize((hash_size, hash_size))
+    pixels = list(grayscale.getdata())
+
+    if not pixels:
+        return [0] * (hash_size * hash_size)
+
+    average = sum(pixels) / len(pixels)
+    return [1 if pixel >= average else 0 for pixel in pixels]
+
+
+def hash_similarity(hash_a: list[int], hash_b: list[int]) -> float:
+    if not hash_a or not hash_b or len(hash_a) != len(hash_b):
+        return 0.0
+
+    distance = sum(1 for a, b in zip(hash_a, hash_b) if a != b)
+    return max(0.0, 1.0 - (distance / len(hash_a)))
+
+
+def topology_match_score(reference_camera: str | None, candidate_camera: str | None) -> float:
+    topology_note = describe_camera_topology(reference_camera, candidate_camera, TOPOLOGY)
+    if topology_note == "same camera":
+        return 1.0
+    if topology_note == "adjacent cameras":
+        return 0.85
+    if topology_note.startswith("connected within "):
+        return 0.65
+    if topology_note == "hard boundary between cameras":
+        return 0.1
+    return 0.35
+
+
+def temporal_match_score(
+    reference_time: float | None, candidate_time: float | None
+) -> float:
+    try:
+        if reference_time is None or candidate_time is None:
+            return 0.4
+        delta = abs(float(candidate_time) - float(reference_time))
+    except Exception:
+        return 0.4
+
+    if delta <= INCIDENT_WINDOW_SECONDS:
+        return 1.0
+    if delta <= 90:
+        return 0.8
+    if delta <= 300:
+        return 0.6
+    if delta <= 900:
+        return 0.45
+    return 0.25
+
+
+def embedding_similarity(image_a: Image.Image, image_b: Image.Image) -> float:
+    try:
+        runtime = get_embedding_runtime()
+    except Exception as e:
+        print(f"[VISUAL] embedding runtime unavailable: {e}")
+        return 0.0
+
+    torch = runtime["torch"]
+    processor = runtime["processor"]
+    model = runtime["model"]
+    device = runtime["device"]
+
+    try:
+        inputs = processor(images=[image_a, image_b], return_tensors="pt")
+        inputs = {key: value.to(device) for key, value in inputs.items()}
+
+        with torch.no_grad():
+            if hasattr(model, "get_image_features"):
+                embeddings = model.get_image_features(
+                    pixel_values=inputs["pixel_values"]
+                )
+            else:
+                outputs = model(**inputs)
+                if getattr(outputs, "pooler_output", None) is not None:
+                    embeddings = outputs.pooler_output
+                elif getattr(outputs, "image_embeds", None) is not None:
+                    embeddings = outputs.image_embeds
+                else:
+                    embeddings = outputs.last_hidden_state.mean(dim=1)
+
+        embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
+        similarity = torch.sum(embeddings[0] * embeddings[1]).item()
+        return max(0.0, min(1.0, (similarity + 1.0) / 2.0))
+    except Exception as e:
+        print(f"[VISUAL] embedding similarity failed: {e}")
+        return 0.0
+
+
+def local_hash_match_score(reference_events: list[dict], candidate_event: dict) -> dict | None:
+    if not reference_events or not candidate_event.get("thumb_url"):
+        return None
+
+    candidate_image = prepare_local_match_image(candidate_event)
+    if not candidate_image:
+        return None
+
+    try:
+        candidate_hash = image_average_hash(candidate_image)
+    except Exception as e:
+        print(f"[VISUAL] failed to hash candidate {candidate_event.get('id')}: {e}")
+        return None
+
+    best_score = -1.0
+    best_similarity = 0.0
+    best_topology = 0.0
+    best_temporal = 0.0
+    best_reference = None
+    candidate_label = normalize_label(candidate_event.get("label"))
+
+    for reference in reference_events:
+        reference_image = prepare_local_match_image(reference)
+        if not reference_image:
+            continue
+
+        try:
+            reference_hash = image_average_hash(reference_image)
+        except Exception as e:
+            print(f"[VISUAL] failed to hash reference {reference.get('id')}: {e}")
+            continue
+
+        similarity = hash_similarity(reference_hash, candidate_hash)
+        topology_score = topology_match_score(
+            reference.get("camera"), candidate_event.get("camera")
+        )
+        temporal_score = temporal_match_score(
+            reference.get("start_time"), candidate_event.get("start_time")
+        )
+        label_score = (
+            1.0
+            if labels_are_visually_compatible(reference.get("label"), candidate_label)
+            else 0.0
+        )
+
+        score = (
+            (0.6 * similarity)
+            + (0.2 * topology_score)
+            + (0.15 * temporal_score)
+            + (0.05 * label_score)
+        )
+
+        if score > best_score:
+            best_score = score
+            best_similarity = similarity
+            best_topology = topology_score
+            best_temporal = temporal_score
+            best_reference = reference
+
+    if best_reference is None:
+        return None
+
+    return {
+        "match": best_score >= VISUAL_VALIDATION_THRESHOLD,
+        "confidence": max(0.0, min(1.0, best_score)),
+        "reason": (
+            f"local hash score={best_score:.2f} image={best_similarity:.2f} "
+            f"topology={best_topology:.2f} time={best_temporal:.2f} "
+            f"ref={best_reference.get('id')}"
+        ),
+        "method": "hash",
+    }
+
+
+def local_embedding_match_score(
+    reference_events: list[dict], candidate_event: dict
+) -> dict | None:
+    if not reference_events or not candidate_event.get("thumb_url"):
+        return None
+
+    candidate_image = prepare_local_match_image(candidate_event)
+    if not candidate_image:
+        return None
+
+    best_score = -1.0
+    best_similarity = 0.0
+    best_topology = 0.0
+    best_temporal = 0.0
+    best_reference = None
+    candidate_label = normalize_label(candidate_event.get("label"))
+
+    for reference in reference_events:
+        reference_image = prepare_local_match_image(reference)
+        if not reference_image:
+            continue
+
+        similarity = embedding_similarity(reference_image, candidate_image)
+        topology_score = topology_match_score(
+            reference.get("camera"), candidate_event.get("camera")
+        )
+        temporal_score = temporal_match_score(
+            reference.get("start_time"), candidate_event.get("start_time")
+        )
+        label_score = (
+            1.0
+            if labels_are_visually_compatible(reference.get("label"), candidate_label)
+            else 0.0
+        )
+
+        score = (
+            (0.7 * similarity)
+            + (0.15 * topology_score)
+            + (0.1 * temporal_score)
+            + (0.05 * label_score)
+        )
+
+        if score > best_score:
+            best_score = score
+            best_similarity = similarity
+            best_topology = topology_score
+            best_temporal = temporal_score
+            best_reference = reference
+
+    if best_reference is None:
+        return None
+
+    return {
+        "match": best_score >= VISUAL_VALIDATION_THRESHOLD,
+        "confidence": max(0.0, min(1.0, best_score)),
+        "reason": (
+            f"local embedding score={best_score:.2f} image={best_similarity:.2f} "
+            f"topology={best_topology:.2f} time={best_temporal:.2f} "
+            f"ref={best_reference.get('id')}"
+        ),
+        "method": "embedding",
+    }
+
+
+def local_visual_match_score(reference_events: list[dict], candidate_event: dict) -> dict | None:
+    if VISUAL_LOCAL_MATCHER == "embedding":
+        result = local_embedding_match_score(reference_events, candidate_event)
+        if result:
+            return result
+    return local_hash_match_score(reference_events, candidate_event)
+
+
 def call_visual_validation(
     reference_events: list[dict], candidate_event: dict
 ) -> dict | None:
@@ -1419,6 +1871,43 @@ def call_visual_validation(
         return None
 
 
+def resolve_visual_match(
+    reference_events: list[dict], candidate_event: dict
+) -> dict | None:
+    mode = VISUAL_MATCHER_MODE
+
+    if mode == "hash":
+        return local_visual_match_score(reference_events, candidate_event)
+
+    if mode == "hybrid":
+        local_result = local_visual_match_score(reference_events, candidate_event)
+        if local_result:
+            confidence = float(local_result.get("confidence", 0.0))
+            if confidence >= VISUAL_LOCAL_MATCH_THRESHOLD:
+                local_result["match"] = True
+                local_result["reason"] = (
+                    f"{local_result.get('reason')} auto-accepted locally"
+                )
+                return local_result
+            if confidence <= VISUAL_LOCAL_REJECT_THRESHOLD:
+                local_result["match"] = False
+                local_result["reason"] = (
+                    f"{local_result.get('reason')} auto-rejected locally"
+                )
+                return local_result
+
+        llm_result = call_visual_validation(reference_events, candidate_event)
+        if llm_result:
+            llm_result["method"] = "llm"
+            return llm_result
+        return local_result
+
+    result = call_visual_validation(reference_events, candidate_event)
+    if result:
+        result["method"] = "llm"
+    return result
+
+
 def clean_visual_exclusion_reason(reason: object) -> str | None:
     if reason is None:
         return None
@@ -1488,55 +1977,67 @@ def call_incident_llm(
         "events": compact_events,
     }
 
-    try:
-        print(f"[LLM] calling {LLM_BASE_URL} model={LLM_MODEL}")
-        response = requests.post(
-            f"{LLM_BASE_URL}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {LLM_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": LLM_MODEL,
-                "temperature": 0.2,
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {
-                        "role": "user",
-                        "content": json.dumps(user_prompt, ensure_ascii=False),
-                    },
-                ],
-            },
-            timeout=LLM_TIMEOUT,
-        )
-        response.raise_for_status()
-        data = response.json()
-
-        content = data["choices"][0]["message"]["content"]
-        if isinstance(content, list):
-            content = "".join(
-                part.get("text", "") for part in content if isinstance(part, dict)
+    last_error = None
+    for attempt in range(1, INCIDENT_LLM_MAX_RETRIES + 1):
+        try:
+            print(
+                f"[LLM] incident synthesis calling {LLM_BASE_URL} model={LLM_MODEL} "
+                f"attempt={attempt}/{INCIDENT_LLM_MAX_RETRIES} timeout={INCIDENT_LLM_TIMEOUT}s"
             )
+            response = requests.post(
+                f"{LLM_BASE_URL}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {LLM_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": LLM_MODEL,
+                    "temperature": 0.2,
+                    "messages": [
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {
+                            "role": "user",
+                            "content": json.dumps(user_prompt, ensure_ascii=False),
+                        },
+                    ],
+                },
+                timeout=INCIDENT_LLM_TIMEOUT,
+            )
+            response.raise_for_status()
+            data = response.json()
 
-        parsed = extract_json_from_text(content)
+            content = data["choices"][0]["message"]["content"]
+            if isinstance(content, list):
+                content = "".join(
+                    part.get("text", "") for part in content if isinstance(part, dict)
+                )
 
-        behavior = parsed.get("behavior")
-        if behavior not in {"routine", "monitor", "concerning"}:
-            behavior = "monitor"
+            parsed = extract_json_from_text(content)
 
-        severity_ai = parsed.get("severity")
-        if severity_ai not in {"low", "medium", "high"}:
-            severity_ai = None
+            behavior = parsed.get("behavior")
+            if behavior not in {"routine", "monitor", "concerning"}:
+                behavior = "monitor"
 
-        return {
-            "title_ai": parsed.get("title"),
-            "summary_ai": parsed.get("summary"),
-            "behavior": behavior,
-            "severity_ai": severity_ai,
-        }
-    except Exception as e:
-        print("LLM incident synthesis failed:", e)
-        return None
+            severity_ai = parsed.get("severity")
+            if severity_ai not in {"low", "medium", "high"}:
+                severity_ai = None
+
+            return {
+                "title_ai": parsed.get("title"),
+                "summary_ai": parsed.get("summary"),
+                "behavior": behavior,
+                "severity_ai": severity_ai,
+            }
+        except Exception as e:
+            last_error = e
+            print(
+                f"LLM incident synthesis failed on attempt {attempt}/"
+                f"{INCIDENT_LLM_MAX_RETRIES}: {e}"
+            )
+            if attempt < INCIDENT_LLM_MAX_RETRIES:
+                time.sleep(min(2 * attempt, 5))
+
+    return None
 
 
 def incident_is_ready_for_llm(
@@ -1544,6 +2045,12 @@ def incident_is_ready_for_llm(
 ) -> tuple[bool, str]:
     if not event_rows:
         return False, "no_events"
+
+    if (
+        not INCIDENT_PROCESS_BELOW_MIN_EVENTS
+        and not incident_meets_minimum_event_count(len(event_rows))
+    ):
+        return False, "waiting_for_min_events"
 
     if visual_validation_should_run(event_rows):
         if visual_status not in ("ready", "skipped", "error"):
@@ -1556,8 +2063,10 @@ def incident_is_ready_for_llm(
     latest_update = max((row["updated_at"] or "" for row in event_rows), default="")
     if latest_update:
         try:
-            latest_dt = datetime.fromisoformat(latest_update)
-            idle_seconds = (datetime.utcnow() - latest_dt).total_seconds()
+            latest_dt = parse_iso_timestamp(latest_update)
+            if not latest_dt:
+                raise ValueError("invalid latest_update timestamp")
+            idle_seconds = (utc_now() - latest_dt).total_seconds()
             if idle_seconds >= INCIDENT_LLM_IDLE_SECONDS:
                 return True, f"idle_{int(idle_seconds)}s"
         except Exception:
@@ -1635,7 +2144,7 @@ def refresh_incident_record(conn: sqlite3.Connection, incident_id: str) -> None:
                label, score, severity, thumb_path,
                metadata_title, metadata_summary, metadata_scene,
                metadata_confidence, metadata_threat_level,
-               visual_match, visual_confidence, visual_exclusion_reason, visual_manual_override, manual_order,
+               visual_match, visual_confidence, visual_exclusion_reason, visual_manual_override, visual_method, manual_order,
                zones_json, objects_json, updated_at
         FROM events
         WHERE incident_id = ?
@@ -1961,7 +2470,7 @@ def prune_small_incidents_once(conn: sqlite3.Connection) -> dict[str, int]:
     if INCIDENT_MIN_EVENTS <= 1:
         return {"deleted_incidents": 0, "deleted_events": 0}
 
-    now = datetime.utcnow()
+    now = utc_now()
     incident_rows = conn.execute(
         """
         SELECT incident_id, event_count, updated_at, source_updated_at, manual_editing
@@ -2330,7 +2839,7 @@ def process_pending_visual_validation_once() -> None:
                 rows = conn.execute(
                     """
                     SELECT id, camera, label, start_time, thumb_path, updated_at, visual_match, visual_confidence, manual_order
-                           , visual_manual_override
+                           , visual_manual_override, visual_method
                     FROM events
                     WHERE incident_id = ?
                     """,
@@ -2386,6 +2895,7 @@ def process_pending_visual_validation_once() -> None:
                             "thumb_url": thumb_url,
                             "visual_manual_override": bool(row["visual_manual_override"]),
                             "visual_confidence": row["visual_confidence"],
+                            "visual_method": row["visual_method"],
                         }
                     )
 
@@ -2413,6 +2923,7 @@ def process_pending_visual_validation_once() -> None:
                     UPDATE events
                     SET visual_match = 1,
                         visual_confidence = 1.0,
+                        visual_method = 'anchor',
                         visual_exclusion_reason = NULL
                     WHERE id = ?
                     """,
@@ -2431,6 +2942,7 @@ def process_pending_visual_validation_once() -> None:
                             """
                             UPDATE events
                             SET visual_match = 1,
+                                visual_method = 'manual',
                                 visual_exclusion_reason = NULL
                             WHERE id = ?
                             """,
@@ -2458,7 +2970,7 @@ def process_pending_visual_validation_once() -> None:
                         ]
                     else:
                         reference_events = [eligible_references[-1]]
-                    result = call_visual_validation(reference_events, event)
+                    result = resolve_visual_match(reference_events, event)
 
                     if not result:
                         conn.execute(
@@ -2478,6 +2990,7 @@ def process_pending_visual_validation_once() -> None:
                         break
 
                     confidence = float(result.get("confidence", 0.0))
+                    method = str(result.get("method") or VISUAL_MATCHER_MODE)
                     chain_confidences.append(confidence)
                     effective_threshold = visual_validation_threshold_for(
                         reference_events, event
@@ -2501,12 +3014,14 @@ def process_pending_visual_validation_once() -> None:
                         UPDATE events
                         SET visual_match = ?,
                             visual_confidence = ?,
+                            visual_method = ?,
                             visual_exclusion_reason = ?
                         WHERE id = ?
                         """,
                         (
                             match,
                             confidence,
+                            method,
                             exclusion_reason,
                             event["id"],
                         ),
@@ -2528,12 +3043,14 @@ def process_pending_visual_validation_once() -> None:
                             visual_error = NULL,
                             visual_updated_at = ?,
                             visual_confidence = ?,
+                            visual_method = ?,
                             updated_at = ?
                         WHERE incident_id = ?
                         """,
                         (
                             utc_now_iso(),
                             overall_confidence,
+                            VISUAL_MATCHER_MODE,
                             utc_now_iso(),
                             incident_id,
                         ),
@@ -2848,15 +3365,17 @@ def process_pending_incidents_once() -> None:
                     )
                     conn.commit()
                 else:
+                    error_message = "LLM synthesis failed or returned invalid JSON"
                     conn.execute(
                         """
                         UPDATE incidents
                         SET llm_status = 'error',
-                            llm_error = 'LLM synthesis failed or returned invalid JSON',
+                            llm_error = ?,
                             updated_at = ?
                         WHERE incident_id = ?
                         """,
                         (
+                            error_message,
                             utc_now_iso(),
                             incident_id,
                         ),
@@ -3424,10 +3943,14 @@ def health():
             "incident_window_seconds": INCIDENT_WINDOW_SECONDS,
             "incident_llm_idle_seconds": INCIDENT_LLM_IDLE_SECONDS,
             "incident_min_events": INCIDENT_MIN_EVENTS,
+            "incident_process_below_min_events": INCIDENT_PROCESS_BELOW_MIN_EVENTS,
             "incident_min_events_prune_seconds": INCIDENT_MIN_EVENTS_PRUNE_SECONDS,
             "llm_enabled": bool(LLM_BASE_URL and LLM_MODEL),
             "llm_base_url": LLM_BASE_URL,
             "llm_model": LLM_MODEL,
+            "llm_timeout": LLM_TIMEOUT,
+            "incident_llm_timeout": INCIDENT_LLM_TIMEOUT,
+            "incident_llm_max_retries": INCIDENT_LLM_MAX_RETRIES,
             "prompt_path": PROMPT_PATH,
             "visual_prompt_path": VISUAL_PROMPT_PATH,
             "topology_path": TOPOLOGY_PATH,
@@ -3442,10 +3965,19 @@ def health():
             "day_start_hour": DAY_START_HOUR,
             "night_start_hour": NIGHT_START_HOUR,
             "visual_validation_enabled": VISUAL_VALIDATION_ENABLED,
+            "visual_matcher_mode": VISUAL_MATCHER_MODE,
+            "visual_local_matcher": VISUAL_LOCAL_MATCHER,
+            "visual_detector_mode": VISUAL_DETECTOR_MODE,
+            "visual_detector_model": VISUAL_DETECTOR_MODEL,
+            "visual_detector_confidence": VISUAL_DETECTOR_CONFIDENCE,
+            "visual_embedding_model": VISUAL_EMBEDDING_MODEL,
             "visual_validation_model": VISUAL_VALIDATION_MODEL,
             "visual_validation_min_events": VISUAL_VALIDATION_MIN_EVENTS,
             "visual_validation_max_images": VISUAL_VALIDATION_MAX_IMAGES,
             "visual_validation_threshold": VISUAL_VALIDATION_THRESHOLD,
+            "visual_local_match_threshold": VISUAL_LOCAL_MATCH_THRESHOLD,
+            "visual_local_reject_threshold": VISUAL_LOCAL_REJECT_THRESHOLD,
+            "visual_hash_size": VISUAL_HASH_SIZE,
             "video_generation_enabled": VIDEO_GENERATION_ENABLED,
             "video_output_dir": VIDEO_OUTPUT_DIR,
             "video_ffmpeg_bin": VIDEO_FFMPEG_BIN,
@@ -3456,6 +3988,7 @@ def health():
 
 
 if __name__ == "__main__":
+    configure_logging()
     init_db()
     start_mqtt()
     start_incident_worker()
