@@ -59,6 +59,12 @@ LLM_MODEL = os.getenv("LLM_MODEL", "")
 LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "20"))
 INCIDENT_LLM_TIMEOUT = int(os.getenv("INCIDENT_LLM_TIMEOUT", str(LLM_TIMEOUT)))
 INCIDENT_LLM_MAX_RETRIES = max(1, int(os.getenv("INCIDENT_LLM_MAX_RETRIES", "2")))
+INCIDENT_GENAI_WAIT_SECONDS = int(
+    os.getenv("INCIDENT_GENAI_WAIT_SECONDS", str(INCIDENT_LLM_IDLE_SECONDS))
+)
+INCIDENT_CLOSE_IDLE_SECONDS = int(
+    os.getenv("INCIDENT_CLOSE_IDLE_SECONDS", str(INCIDENT_GENAI_WAIT_SECONDS))
+)
 
 TOPOLOGY_PATH = os.getenv("TOPOLOGY_PATH", "camera_topology.json")
 TOPOLOGY_MAX_HOPS = int(os.getenv("TOPOLOGY_MAX_HOPS", "2"))
@@ -197,6 +203,31 @@ def incident_meets_minimum_event_count(event_count: int | None) -> bool:
         return int(event_count or 0) >= INCIDENT_MIN_EVENTS
     except Exception:
         return False
+
+
+def incident_lifecycle_state(
+    event_rows: list[sqlite3.Row],
+) -> tuple[str, str, str | None]:
+    if not event_rows:
+        return "open", "no_events", None
+
+    terminal_event_types = {"end", "genai"}
+    has_nonterminal = any(
+        (row["event_type"] or "").strip().lower() not in terminal_event_types
+        for row in event_rows
+    )
+    if has_nonterminal:
+        return "open", "waiting_for_event_end", None
+
+    latest_update = max((row["updated_at"] or "" for row in event_rows), default="")
+    latest_dt = parse_iso_timestamp(latest_update)
+    if latest_dt:
+        idle_seconds = (utc_now() - latest_dt).total_seconds()
+        if idle_seconds < INCIDENT_CLOSE_IDLE_SECONDS:
+            return "open", "waiting_for_incident_quiet_period", None
+        return "closed", f"closed_idle_{int(idle_seconds)}s", latest_dt.isoformat()
+
+    return "closed", "all_events_terminal", None
 
 
 def normalize_timestamp(value) -> float:
@@ -584,6 +615,10 @@ def init_db() -> None:
             video_updated_at TEXT,
             video_path TEXT,
             video_url TEXT,
+            lifecycle_status TEXT,
+            lifecycle_reason TEXT,
+            lifecycle_updated_at TEXT,
+            lifecycle_closed_at TEXT,
             manual_editing INTEGER,
             source_updated_at TEXT,
             created_at TEXT,
@@ -609,6 +644,10 @@ def init_db() -> None:
         "video_updated_at": "ALTER TABLE incidents ADD COLUMN video_updated_at TEXT",
         "video_path": "ALTER TABLE incidents ADD COLUMN video_path TEXT",
         "video_url": "ALTER TABLE incidents ADD COLUMN video_url TEXT",
+        "lifecycle_status": "ALTER TABLE incidents ADD COLUMN lifecycle_status TEXT",
+        "lifecycle_reason": "ALTER TABLE incidents ADD COLUMN lifecycle_reason TEXT",
+        "lifecycle_updated_at": "ALTER TABLE incidents ADD COLUMN lifecycle_updated_at TEXT",
+        "lifecycle_closed_at": "ALTER TABLE incidents ADD COLUMN lifecycle_closed_at TEXT",
         "manual_editing": "ALTER TABLE incidents ADD COLUMN manual_editing INTEGER",
     }
 
@@ -628,6 +667,9 @@ def init_db() -> None:
     )
     c.execute(
         "CREATE INDEX IF NOT EXISTS idx_incidents_visual_status ON incidents (visual_status)"
+    )
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS idx_incidents_lifecycle_status ON incidents (lifecycle_status)"
     )
     c.execute(
         "CREATE INDEX IF NOT EXISTS idx_incidents_source_updated_at ON incidents (source_updated_at)"
@@ -2041,7 +2083,10 @@ def call_incident_llm(
 
 
 def incident_is_ready_for_llm(
-    event_rows: list[sqlite3.Row], visual_status: str | None
+    event_rows: list[sqlite3.Row],
+    visual_status: str | None,
+    lifecycle_status: str | None,
+    lifecycle_reason: str | None = None,
 ) -> tuple[bool, str]:
     if not event_rows:
         return False, "no_events"
@@ -2052,6 +2097,9 @@ def incident_is_ready_for_llm(
     ):
         return False, "waiting_for_min_events"
 
+    if lifecycle_status != "closed":
+        return False, lifecycle_reason or "waiting_for_incident_close"
+
     if visual_validation_should_run(event_rows):
         if visual_status not in ("ready", "skipped", "error"):
             return False, "waiting_for_visual_validation"
@@ -2059,20 +2107,7 @@ def incident_is_ready_for_llm(
     for row in event_rows:
         if row["metadata_title"] or row["metadata_summary"] or row["metadata_scene"]:
             return True, "event_genai_present"
-
-    latest_update = max((row["updated_at"] or "" for row in event_rows), default="")
-    if latest_update:
-        try:
-            latest_dt = parse_iso_timestamp(latest_update)
-            if not latest_dt:
-                raise ValueError("invalid latest_update timestamp")
-            idle_seconds = (utc_now() - latest_dt).total_seconds()
-            if idle_seconds >= INCIDENT_LLM_IDLE_SECONDS:
-                return True, f"idle_{int(idle_seconds)}s"
-        except Exception:
-            pass
-
-    return False, "waiting_for_genai_or_idle"
+    return True, lifecycle_reason or "incident_closed"
 
 
 def upsert_event(conn: sqlite3.Connection, event: dict) -> str:
@@ -2224,6 +2259,7 @@ def refresh_incident_record(conn: sqlite3.Connection, incident_id: str) -> None:
                source_updated_at, created_at, llm_error,
                visual_status, visual_error, visual_updated_at, visual_confidence,
                video_status, video_error, video_updated_at, video_path, video_url,
+               lifecycle_status, lifecycle_reason, lifecycle_updated_at, lifecycle_closed_at,
                manual_editing
         FROM incidents
         WHERE incident_id = ?
@@ -2232,57 +2268,109 @@ def refresh_incident_record(conn: sqlite3.Connection, incident_id: str) -> None:
     ).fetchone()
 
     manual_editing = bool(existing_incident["manual_editing"]) if existing_incident else False
+    lifecycle_status, lifecycle_reason, lifecycle_closed_at = incident_lifecycle_state(
+        event_rows
+    )
+    lifecycle_updated_at = utc_now_iso()
+
+    if existing_incident:
+        existing_source_updated_at = existing_incident["source_updated_at"] or ""
+        existing_lifecycle_status_raw = (
+            str(existing_incident["lifecycle_status"] or "").strip().lower()
+        )
+        existing_lifecycle_status = existing_lifecycle_status_raw or "open"
+        existing_closed_at = existing_incident["lifecycle_closed_at"]
+        if existing_source_updated_at == source_updated_at:
+            if (
+                existing_lifecycle_status_raw
+                and existing_lifecycle_status == lifecycle_status
+                and (existing_incident["lifecycle_reason"] or "") == lifecycle_reason
+                and existing_closed_at == lifecycle_closed_at
+            ):
+                lifecycle_updated_at = (
+                    existing_incident["lifecycle_updated_at"] or lifecycle_updated_at
+                )
+                lifecycle_reason = existing_incident["lifecycle_reason"] or lifecycle_reason
+                lifecycle_closed_at = existing_closed_at
+        elif lifecycle_status == "open":
+            lifecycle_closed_at = None
 
     visual_should_run = visual_validation_should_run(event_rows)
-    visual_status = "pending" if visual_should_run else "skipped"
+    visual_status = "waiting" if lifecycle_status != "closed" else (
+        "pending" if visual_should_run else "skipped"
+    )
     visual_error = None
     visual_updated_at = None
     visual_confidence = None
 
-    if existing_incident:
+    if existing_incident and lifecycle_status == "closed":
         existing_source_updated_at = existing_incident["source_updated_at"] or ""
         existing_visual_status = existing_incident["visual_status"] or (
             "pending" if visual_should_run else "skipped"
         )
 
-        if existing_source_updated_at == source_updated_at:
+        if (
+            existing_source_updated_at == source_updated_at
+            and existing_lifecycle_status_raw
+            and existing_lifecycle_status == lifecycle_status
+        ):
             visual_status = existing_visual_status
             visual_error = existing_incident["visual_error"]
             visual_updated_at = existing_incident["visual_updated_at"]
             visual_confidence = existing_incident["visual_confidence"]
         else:
-            visual_status = "pending" if visual_should_run else "skipped"
+            visual_status = (
+                "pending"
+                if lifecycle_status == "closed" and visual_should_run
+                else "waiting"
+                if lifecycle_status != "closed"
+                else "skipped"
+            )
             visual_error = None
             visual_updated_at = None
             visual_confidence = None
 
     video_should_run = video_generation_should_run(event_rows)
-    video_status = "pending" if video_should_run else "skipped"
+    video_status = "waiting" if lifecycle_status != "closed" else (
+        "pending" if video_should_run else "skipped"
+    )
     video_error = None
     video_updated_at = None
     video_path = None
     video_url = None
 
-    if existing_incident:
+    if existing_incident and lifecycle_status == "closed":
         existing_source_updated_at = existing_incident["source_updated_at"] or ""
         existing_video_status = existing_incident["video_status"] or (
             "pending" if video_should_run else "skipped"
         )
 
-        if existing_source_updated_at == source_updated_at:
+        if (
+            existing_source_updated_at == source_updated_at
+            and existing_lifecycle_status_raw
+            and existing_lifecycle_status == lifecycle_status
+        ):
             video_status = existing_video_status
             video_error = existing_incident["video_error"]
             video_updated_at = existing_incident["video_updated_at"]
             video_path = existing_incident["video_path"]
             video_url = existing_incident["video_url"]
         else:
-            video_status = "pending" if video_should_run else "skipped"
+            video_status = (
+                "pending"
+                if lifecycle_status == "closed" and video_should_run
+                else "waiting"
+                if lifecycle_status != "closed"
+                else "skipped"
+            )
             video_error = None
             video_updated_at = None
             video_path = None
             video_url = None
 
-    llm_ready, llm_ready_reason = incident_is_ready_for_llm(event_rows, visual_status)
+    llm_ready, llm_ready_reason = incident_is_ready_for_llm(
+        event_rows, visual_status, lifecycle_status, lifecycle_reason
+    )
 
     llm_status = "pending" if llm_ready else "waiting"
     llm_updated_at = None
@@ -2320,6 +2408,10 @@ def refresh_incident_record(conn: sqlite3.Connection, incident_id: str) -> None:
                 llm_error = None
             elif existing_status == "ready" and llm_ready:
                 llm_status = "ready"
+            elif existing_status in {"ready", "pending"} and not llm_ready:
+                llm_status = "waiting"
+                llm_updated_at = None
+                llm_error = None
             elif existing_status == "error" and not llm_ready:
                 llm_status = "waiting"
             else:
@@ -2342,6 +2434,12 @@ def refresh_incident_record(conn: sqlite3.Connection, incident_id: str) -> None:
         video_updated_at = existing_incident["video_updated_at"]
         video_path = existing_incident["video_path"]
         video_url = existing_incident["video_url"]
+        lifecycle_status = existing_incident["lifecycle_status"] or lifecycle_status
+        lifecycle_reason = existing_incident["lifecycle_reason"] or lifecycle_reason
+        lifecycle_updated_at = (
+            existing_incident["lifecycle_updated_at"] or lifecycle_updated_at
+        )
+        lifecycle_closed_at = existing_incident["lifecycle_closed_at"] or lifecycle_closed_at
 
     conn.execute(
         """
@@ -2354,10 +2452,11 @@ def refresh_incident_record(conn: sqlite3.Connection, incident_id: str) -> None:
             llm_ready, llm_ready_reason,
             visual_status, visual_error, visual_updated_at, visual_confidence,
             video_status, video_error, video_updated_at, video_path, video_url,
+            lifecycle_status, lifecycle_reason, lifecycle_updated_at, lifecycle_closed_at,
             manual_editing,
             source_updated_at, created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(incident_id) DO UPDATE SET
             start_time=excluded.start_time,
             end_time=excluded.end_time,
@@ -2387,6 +2486,10 @@ def refresh_incident_record(conn: sqlite3.Connection, incident_id: str) -> None:
             video_updated_at=excluded.video_updated_at,
             video_path=excluded.video_path,
             video_url=excluded.video_url,
+            lifecycle_status=excluded.lifecycle_status,
+            lifecycle_reason=excluded.lifecycle_reason,
+            lifecycle_updated_at=excluded.lifecycle_updated_at,
+            lifecycle_closed_at=excluded.lifecycle_closed_at,
             manual_editing=excluded.manual_editing,
             source_updated_at=excluded.source_updated_at,
             updated_at=excluded.updated_at
@@ -2421,6 +2524,10 @@ def refresh_incident_record(conn: sqlite3.Connection, incident_id: str) -> None:
             video_updated_at,
             video_path,
             video_url,
+            lifecycle_status,
+            lifecycle_reason,
+            lifecycle_updated_at,
+            lifecycle_closed_at,
             1 if manual_editing else 0,
             source_updated_at,
             created_at,
@@ -2440,7 +2547,9 @@ def refresh_waiting_incidents_to_pending() -> None:
                 FROM incidents
                 WHERE (
                         llm_status = 'waiting'
+                        OR visual_status = 'waiting'
                         OR visual_status = 'pending'
+                        OR video_status = 'waiting'
                         OR video_status IS NULL
                         OR video_status = 'pending'
                     )
@@ -2673,14 +2782,14 @@ def _set_incident_manual_editing(
                 llm_error = NULL,
                 llm_updated_at = NULL,
                 visual_status = CASE
-                    WHEN visual_status IN ('ready', 'pending', 'error') THEN 'pending'
+                    WHEN visual_status IN ('ready', 'pending', 'error', 'waiting') THEN 'pending'
                     ELSE visual_status
                 END,
                 visual_error = NULL,
                 visual_updated_at = NULL,
                 visual_confidence = NULL,
                 video_status = CASE
-                    WHEN video_status IN ('ready', 'pending', 'error') OR video_status IS NULL THEN 'pending'
+                    WHEN video_status IN ('ready', 'pending', 'error', 'waiting') OR video_status IS NULL THEN 'pending'
                     ELSE video_status
                 END,
                 video_error = NULL,
@@ -2826,6 +2935,7 @@ def process_pending_visual_validation_once() -> None:
             SELECT incident_id
             FROM incidents
             WHERE visual_status = 'pending'
+              AND lifecycle_status = 'closed'
               AND COALESCE(manual_editing, 0) = 0
             ORDER BY updated_at ASC
             LIMIT 5
@@ -3095,6 +3205,7 @@ def process_pending_incident_videos_once() -> None:
             SELECT incident_id, visual_status
             FROM incidents
             WHERE video_status = 'pending'
+              AND lifecycle_status = 'closed'
               AND COALESCE(manual_editing, 0) = 0
             ORDER BY updated_at ASC
             LIMIT 10
@@ -3246,6 +3357,7 @@ def process_pending_incidents_once() -> None:
             FROM incidents
             WHERE llm_status = 'pending'
               AND llm_ready = 1
+              AND lifecycle_status = 'closed'
               AND COALESCE(manual_editing, 0) = 0
             ORDER BY updated_at ASC
             LIMIT 5
@@ -3649,6 +3761,9 @@ def api_incidents():
                 "start_time": incident["start_time"],
                 "end_time": incident["end_time"],
                 "updated_at": incident["updated_at"],
+                "lifecycle_status": incident["lifecycle_status"],
+                "lifecycle_reason": incident["lifecycle_reason"],
+                "lifecycle_closed_at": incident["lifecycle_closed_at"],
                 "llm_cached": incident["llm_status"] == "ready",
                 "llm_status": incident["llm_status"],
                 "llm_error": incident["llm_error"],
@@ -3942,6 +4057,8 @@ def health():
             "frigate_vod_base": FRIGATE_VOD_BASE,
             "incident_window_seconds": INCIDENT_WINDOW_SECONDS,
             "incident_llm_idle_seconds": INCIDENT_LLM_IDLE_SECONDS,
+            "incident_genai_wait_seconds": INCIDENT_GENAI_WAIT_SECONDS,
+            "incident_close_idle_seconds": INCIDENT_CLOSE_IDLE_SECONDS,
             "incident_min_events": INCIDENT_MIN_EVENTS,
             "incident_process_below_min_events": INCIDENT_PROCESS_BELOW_MIN_EVENTS,
             "incident_min_events_prune_seconds": INCIDENT_MIN_EVENTS_PRUNE_SECONDS,
