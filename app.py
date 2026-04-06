@@ -43,7 +43,6 @@ FRIGATE_CLIP_PREFIX = os.getenv("FRIGATE_CLIP_PREFIX", "")
 FRIGATE_VOD_BASE = os.getenv("FRIGATE_VOD_BASE", FRIGATE_PUBLIC_BASE + "/api")
 
 INCIDENT_WINDOW_SECONDS = int(os.getenv("INCIDENT_WINDOW_SECONDS", "30"))
-INCIDENT_LLM_IDLE_SECONDS = int(os.getenv("INCIDENT_LLM_IDLE_SECONDS", "15"))
 INCIDENT_MIN_EVENTS = max(1, int(os.getenv("INCIDENT_MIN_EVENTS", "3")))
 INCIDENT_PROCESS_BELOW_MIN_EVENTS = os.getenv(
     "INCIDENT_PROCESS_BELOW_MIN_EVENTS", "true"
@@ -59,12 +58,7 @@ LLM_MODEL = os.getenv("LLM_MODEL", "")
 LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "20"))
 INCIDENT_LLM_TIMEOUT = int(os.getenv("INCIDENT_LLM_TIMEOUT", str(LLM_TIMEOUT)))
 INCIDENT_LLM_MAX_RETRIES = max(1, int(os.getenv("INCIDENT_LLM_MAX_RETRIES", "2")))
-INCIDENT_GENAI_WAIT_SECONDS = int(
-    os.getenv("INCIDENT_GENAI_WAIT_SECONDS", str(INCIDENT_LLM_IDLE_SECONDS))
-)
-INCIDENT_CLOSE_IDLE_SECONDS = int(
-    os.getenv("INCIDENT_CLOSE_IDLE_SECONDS", str(INCIDENT_GENAI_WAIT_SECONDS))
-)
+INCIDENT_CLOSE_IDLE_SECONDS = int(os.getenv("INCIDENT_CLOSE_IDLE_SECONDS", "15"))
 
 TOPOLOGY_PATH = os.getenv("TOPOLOGY_PATH", "camera_topology.json")
 TOPOLOGY_MAX_HOPS = int(os.getenv("TOPOLOGY_MAX_HOPS", "2"))
@@ -4056,8 +4050,6 @@ def health():
             "frigate_clip_prefix": FRIGATE_CLIP_PREFIX,
             "frigate_vod_base": FRIGATE_VOD_BASE,
             "incident_window_seconds": INCIDENT_WINDOW_SECONDS,
-            "incident_llm_idle_seconds": INCIDENT_LLM_IDLE_SECONDS,
-            "incident_genai_wait_seconds": INCIDENT_GENAI_WAIT_SECONDS,
             "incident_close_idle_seconds": INCIDENT_CLOSE_IDLE_SECONDS,
             "incident_min_events": INCIDENT_MIN_EVENTS,
             "incident_process_below_min_events": INCIDENT_PROCESS_BELOW_MIN_EVENTS,
