@@ -10,3 +10,6 @@ __pycache__/
 build/
 incident_videos/
 .venv/
+incident_videos/
+.venv/
+

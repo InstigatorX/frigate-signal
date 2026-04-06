@@ -1,0 +1,9 @@
+.git
+.gitignore
+.venv
+venv
+__pycache__
+*.pyc
+incident_videos
+events.db
+screenshot.png

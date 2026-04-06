@@ -5,7 +5,7 @@ services:
     restart: unless-stopped
     env_file:
       - .env
-    network_mode: host
+    #network_mode: host
     ports:
       - "5001:5001"
     volumes:

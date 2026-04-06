@@ -45,6 +45,7 @@ TIME CONTEXT:
 - If is_night is true, treat unknown people or movement as more suspicious
 - Nighttime activity should increase likelihood of "monitor" or "concerning"
 - Daytime activity should bias toward "routine" when context supports it
+- convert EPOCH timestamps to real times.
 
 Return ONLY a raw JSON object. Do not include markdown, code fences, or any explanation.
 Do not prefix or suffix the response with any text.
