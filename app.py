@@ -22,6 +22,7 @@ from PIL import Image
 
 DB_PATH = os.getenv("DB_PATH", "events.db")
 APP_PORT = int(os.getenv("APP_PORT", "5001"))
+APP_PUBLIC_BASE = os.getenv("APP_PUBLIC_BASE", f"http://localhost:{APP_PORT}").rstrip("/")
 HTTP_ACCESS_LOGS = os.getenv("HTTP_ACCESS_LOGS", "false").lower() in (
     "1",
     "true",
@@ -32,6 +33,7 @@ HTTP_ACCESS_LOGS = os.getenv("HTTP_ACCESS_LOGS", "false").lower() in (
 MQTT_BROKER = os.getenv("MQTT_BROKER", "192.168.86.252")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 MQTT_TOPIC = os.getenv("MQTT_TOPIC", "frigate/reviews")
+MQTT_INCIDENT_TOPIC = os.getenv("MQTT_INCIDENT_TOPIC", "frigate/signal/incidents")
 MQTT_USERNAME = os.getenv("MQTT_USERNAME", "nodered")
 MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "password")
 MQTT_CLIENT_ID = os.getenv("MQTT_CLIENT_ID", "frigate-signal")
@@ -165,6 +167,8 @@ Path(VIDEO_OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 app = Flask(__name__)
 _worker_started = False
 _worker_lock = threading.Lock()
+_mqtt_client = None
+_mqtt_lock = threading.Lock()
 
 
 def configure_logging() -> None:
@@ -277,6 +281,160 @@ def get_db_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def mqtt_status_is_terminal(status: str | None) -> bool:
+    return str(status or "").strip().lower() in {"ready", "error", "skipped"}
+
+
+def incident_enrichments_complete(incident: sqlite3.Row) -> bool:
+    if not incident:
+        return False
+
+    if not (str(incident["lifecycle_status"] or "").strip().lower() == "closed"):
+        return False
+
+    if LLM_BASE_URL and LLM_MODEL:
+        llm_status = str(incident["llm_status"] or "").strip().lower()
+        llm_ready = bool(incident["llm_ready"])
+        if llm_ready and llm_status not in {"ready", "error"}:
+            return False
+
+    if not mqtt_status_is_terminal(incident["visual_status"]):
+        return False
+
+    if not mqtt_status_is_terminal(incident["video_status"]):
+        return False
+
+    return True
+
+
+def build_incident_mqtt_payload(incident: sqlite3.Row, stage: str) -> dict:
+    stage_value = str(stage or "").strip().lower() or "closed"
+    enriched = stage_value == "enriched"
+    title = incident["title_ai"] or incident["behavior"] or "Incident"
+    summary = incident["summary_ai"] or (
+        "Incident enrichment complete."
+        if enriched
+        else "Incident closed; enrichment pending."
+    )
+
+    return {
+        "incident_id": incident["incident_id"],
+        "stage": stage_value,
+        "status": "ready" if enriched else "closed",
+        "updated_at": utc_now_iso(),
+        "start_time": incident["start_time"],
+        "end_time": incident["end_time"],
+        "severity": incident["severity"],
+        "behavior": incident["behavior"],
+        "title": title,
+        "summary": summary,
+        "video_url": normalize_local_video_url(incident["video_url"]),
+        "review_url": incident["review_url"],
+    }
+
+
+def publish_mqtt_json(topic: str, payload: dict) -> None:
+    client = _mqtt_client
+    if client is None:
+        raise RuntimeError("mqtt_client_unavailable")
+    if hasattr(client, "is_connected") and not client.is_connected():
+        raise RuntimeError("mqtt_client_not_connected")
+
+    message = json.dumps(payload, separators=(",", ":"))
+    with _mqtt_lock:
+        info = client.publish(topic, message, qos=1)
+    result = getattr(info, "rc", mqtt.MQTT_ERR_NO_CONN)
+    if result != mqtt.MQTT_ERR_SUCCESS:
+        raise RuntimeError(f"mqtt_publish_failed_rc_{result}")
+
+
+def process_pending_incident_mqtt_once() -> None:
+    conn = get_db_connection()
+    try:
+        incident_rows = conn.execute(
+            """
+            SELECT incident_id, start_time, end_time, severity, behavior,
+                   title_ai, summary_ai, review_url, video_url,
+                   lifecycle_status, llm_status, llm_ready,
+                   visual_status, video_status, source_updated_at,
+                   mqtt_closed_published_at, mqtt_closed_source_updated_at,
+                   mqtt_enriched_published_at, mqtt_enriched_source_updated_at
+            FROM incidents
+            WHERE event_count >= ?
+              AND COALESCE(manual_editing, 0) = 0
+              AND lifecycle_status = 'closed'
+            ORDER BY updated_at ASC
+            """
+            ,
+            (INCIDENT_MIN_EVENTS,),
+        ).fetchall()
+
+        for incident in incident_rows:
+            incident_id = str(incident["incident_id"] or "").strip()
+            if not incident_id:
+                continue
+
+            source_updated_at = incident["source_updated_at"] or ""
+            if not source_updated_at:
+                continue
+
+            closed_needs_publish = (
+                (incident["mqtt_closed_source_updated_at"] or "") != source_updated_at
+            )
+            enriched_needs_publish = (
+                incident_enrichments_complete(incident)
+                and (incident["mqtt_enriched_source_updated_at"] or "") != source_updated_at
+            )
+
+            if not closed_needs_publish and not enriched_needs_publish:
+                continue
+
+            if closed_needs_publish:
+                closed_payload = build_incident_mqtt_payload(incident, "closed")
+                publish_mqtt_json(MQTT_INCIDENT_TOPIC, closed_payload)
+                conn.execute(
+                    """
+                    UPDATE incidents
+                    SET mqtt_closed_published_at = ?,
+                        mqtt_closed_source_updated_at = ?,
+                        mqtt_publish_error = NULL
+                    WHERE incident_id = ?
+                    """,
+                    (utc_now_iso(), source_updated_at, incident_id),
+                )
+                conn.commit()
+
+            if enriched_needs_publish:
+                enriched_payload = build_incident_mqtt_payload(incident, "enriched")
+                publish_mqtt_json(MQTT_INCIDENT_TOPIC, enriched_payload)
+                conn.execute(
+                    """
+                    UPDATE incidents
+                    SET mqtt_enriched_published_at = ?,
+                        mqtt_enriched_source_updated_at = ?,
+                        mqtt_publish_error = NULL
+                    WHERE incident_id = ?
+                    """,
+                    (utc_now_iso(), source_updated_at, incident_id),
+                )
+                conn.commit()
+    except Exception as e:
+        incident_id = locals().get("incident_id")
+        if incident_id:
+            conn.execute(
+                """
+                UPDATE incidents
+                SET mqtt_publish_error = ?
+                WHERE incident_id = ?
+                """,
+                (str(e)[:500], incident_id),
+            )
+            conn.commit()
+        raise
+    finally:
+        conn.close()
 
 
 def normalize_label(label: str | None) -> str:
@@ -614,6 +772,11 @@ def init_db() -> None:
             lifecycle_updated_at TEXT,
             lifecycle_closed_at TEXT,
             manual_editing INTEGER,
+            mqtt_closed_published_at TEXT,
+            mqtt_closed_source_updated_at TEXT,
+            mqtt_enriched_published_at TEXT,
+            mqtt_enriched_source_updated_at TEXT,
+            mqtt_publish_error TEXT,
             source_updated_at TEXT,
             created_at TEXT,
             updated_at TEXT
@@ -643,6 +806,11 @@ def init_db() -> None:
         "lifecycle_updated_at": "ALTER TABLE incidents ADD COLUMN lifecycle_updated_at TEXT",
         "lifecycle_closed_at": "ALTER TABLE incidents ADD COLUMN lifecycle_closed_at TEXT",
         "manual_editing": "ALTER TABLE incidents ADD COLUMN manual_editing INTEGER",
+        "mqtt_closed_published_at": "ALTER TABLE incidents ADD COLUMN mqtt_closed_published_at TEXT",
+        "mqtt_closed_source_updated_at": "ALTER TABLE incidents ADD COLUMN mqtt_closed_source_updated_at TEXT",
+        "mqtt_enriched_published_at": "ALTER TABLE incidents ADD COLUMN mqtt_enriched_published_at TEXT",
+        "mqtt_enriched_source_updated_at": "ALTER TABLE incidents ADD COLUMN mqtt_enriched_source_updated_at TEXT",
+        "mqtt_publish_error": "ALTER TABLE incidents ADD COLUMN mqtt_publish_error TEXT",
     }
 
     for col, sql in incident_migrations.items():
@@ -769,6 +937,24 @@ def build_event_clip_url(
         f"{VIDEO_SOURCE_BASE.rstrip('/')}/"
         f"{camera}/start/{start_ts}/end/{end_ts}/clip.mp4"
     )
+
+
+def build_local_video_url(incident_id: str | None) -> str | None:
+    value = str(incident_id or "").strip()
+    if not value:
+        return None
+    return f"{APP_PUBLIC_BASE}/video/{value}"
+
+
+def normalize_local_video_url(value: str | None) -> str | None:
+    url = str(value or "").strip()
+    if not url:
+        return None
+    if url.startswith(("http://", "https://")):
+        return url
+    if url.startswith("/video/"):
+        return f"{APP_PUBLIC_BASE}{url}"
+    return url
 
 
 def video_generation_should_run(event_rows: list[sqlite3.Row]) -> bool:
@@ -2790,6 +2976,8 @@ def _set_incident_manual_editing(
                 video_updated_at = NULL,
                 video_path = NULL,
                 video_url = NULL,
+                mqtt_enriched_published_at = NULL,
+                mqtt_enriched_source_updated_at = NULL,
                 updated_at = ?
             WHERE incident_id = ?
             """,
@@ -3291,7 +3479,7 @@ def process_pending_incident_videos_once() -> None:
                         (
                             utc_now_iso(),
                             result,
-                            f"/video/{incident_id}",
+                            build_local_video_url(incident_id),
                             utc_now_iso(),
                             incident_id,
                         ),
@@ -3523,6 +3711,7 @@ def incident_worker_loop() -> None:
             process_pending_visual_validation_once()
             process_pending_incident_videos_once()
             process_pending_incidents_once()
+            process_pending_incident_mqtt_once()
         except Exception as e:
             print(f"[WORKER] error: {e}")
         time.sleep(INCIDENT_WORKER_INTERVAL)
@@ -3571,6 +3760,7 @@ def on_message(client, userdata, msg):
 
 
 def start_mqtt() -> None:
+    global _mqtt_client
     kwargs = {}
     try:
         kwargs["callback_api_version"] = mqtt.CallbackAPIVersion.VERSION2
@@ -3590,6 +3780,7 @@ def start_mqtt() -> None:
 
     client.connect(MQTT_BROKER, MQTT_PORT, 60)
     client.loop_start()
+    _mqtt_client = client
 
 
 @app.route("/")
@@ -4045,6 +4236,7 @@ def health():
             "mqtt_topic": MQTT_TOPIC,
             "mqtt_username_configured": bool(MQTT_USERNAME),
             "mqtt_tls": MQTT_TLS,
+            "app_public_base": APP_PUBLIC_BASE,
             "frigate_public_base": FRIGATE_PUBLIC_BASE,
             "frigate_media_prefix": FRIGATE_MEDIA_PREFIX,
             "frigate_clip_prefix": FRIGATE_CLIP_PREFIX,
