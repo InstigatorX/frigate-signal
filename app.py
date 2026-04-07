@@ -311,18 +311,22 @@ def incident_enrichments_complete(incident: sqlite3.Row) -> bool:
 
 def build_incident_mqtt_payload(incident: sqlite3.Row, stage: str) -> dict:
     stage_value = str(stage or "").strip().lower() or "closed"
+    started = stage_value == "started"
     enriched = stage_value == "enriched"
     title = incident["title_ai"] or incident["behavior"] or "Incident"
-    summary = incident["summary_ai"] or (
-        "Incident enrichment complete."
-        if enriched
-        else "Incident closed; enrichment pending."
-    )
+    if started:
+        summary = incident["summary_ai"] or "Incident started; monitoring for updates."
+    elif enriched:
+        summary = incident["summary_ai"] or "Incident enrichment complete."
+    else:
+        summary = incident["summary_ai"] or "Incident closed; enrichment pending."
 
     return {
         "incident_id": incident["incident_id"],
         "stage": stage_value,
-        "status": "ready" if enriched else "closed",
+        "status": (
+            "ready" if enriched else "open" if started else "closed"
+        ),
         "updated_at": utc_now_iso(),
         "start_time": incident["start_time"],
         "end_time": incident["end_time"],
@@ -355,16 +359,16 @@ def process_pending_incident_mqtt_once() -> None:
     try:
         incident_rows = conn.execute(
             """
-            SELECT incident_id, start_time, end_time, severity, behavior,
+            SELECT incident_id, start_time, end_time, severity, behavior, event_count,
                    title_ai, summary_ai, review_url, video_url,
                    lifecycle_status, llm_status, llm_ready,
                    visual_status, video_status, source_updated_at,
+                   mqtt_started_published_at,
                    mqtt_closed_published_at, mqtt_closed_source_updated_at,
                    mqtt_enriched_published_at, mqtt_enriched_source_updated_at
             FROM incidents
             WHERE event_count >= ?
               AND COALESCE(manual_editing, 0) = 0
-              AND lifecycle_status = 'closed'
             ORDER BY updated_at ASC
             """
             ,
@@ -380,7 +384,14 @@ def process_pending_incident_mqtt_once() -> None:
             if not source_updated_at:
                 continue
 
+            lifecycle_status = str(incident["lifecycle_status"] or "").strip().lower()
+            started_needs_publish = (
+                lifecycle_status == "open"
+                and not (incident["mqtt_started_published_at"] or "")
+            )
             closed_needs_publish = (
+                lifecycle_status == "closed"
+                and
                 (incident["mqtt_closed_source_updated_at"] or "") != source_updated_at
             )
             enriched_needs_publish = (
@@ -388,8 +399,26 @@ def process_pending_incident_mqtt_once() -> None:
                 and (incident["mqtt_enriched_source_updated_at"] or "") != source_updated_at
             )
 
-            if not closed_needs_publish and not enriched_needs_publish:
+            if (
+                not started_needs_publish
+                and not closed_needs_publish
+                and not enriched_needs_publish
+            ):
                 continue
+
+            if started_needs_publish:
+                started_payload = build_incident_mqtt_payload(incident, "started")
+                publish_mqtt_json(MQTT_INCIDENT_TOPIC, started_payload)
+                conn.execute(
+                    """
+                    UPDATE incidents
+                    SET mqtt_started_published_at = ?,
+                        mqtt_publish_error = NULL
+                    WHERE incident_id = ?
+                    """,
+                    (utc_now_iso(), incident_id),
+                )
+                conn.commit()
 
             if closed_needs_publish:
                 closed_payload = build_incident_mqtt_payload(incident, "closed")
@@ -772,6 +801,7 @@ def init_db() -> None:
             lifecycle_updated_at TEXT,
             lifecycle_closed_at TEXT,
             manual_editing INTEGER,
+            mqtt_started_published_at TEXT,
             mqtt_closed_published_at TEXT,
             mqtt_closed_source_updated_at TEXT,
             mqtt_enriched_published_at TEXT,
@@ -806,6 +836,7 @@ def init_db() -> None:
         "lifecycle_updated_at": "ALTER TABLE incidents ADD COLUMN lifecycle_updated_at TEXT",
         "lifecycle_closed_at": "ALTER TABLE incidents ADD COLUMN lifecycle_closed_at TEXT",
         "manual_editing": "ALTER TABLE incidents ADD COLUMN manual_editing INTEGER",
+        "mqtt_started_published_at": "ALTER TABLE incidents ADD COLUMN mqtt_started_published_at TEXT",
         "mqtt_closed_published_at": "ALTER TABLE incidents ADD COLUMN mqtt_closed_published_at TEXT",
         "mqtt_closed_source_updated_at": "ALTER TABLE incidents ADD COLUMN mqtt_closed_source_updated_at TEXT",
         "mqtt_enriched_published_at": "ALTER TABLE incidents ADD COLUMN mqtt_enriched_published_at TEXT",
